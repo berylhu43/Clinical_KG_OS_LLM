@@ -57,6 +57,42 @@ Output JSON with nodes (id, text, type, evidence, turn_id) and edges (source_id,
 Output ONLY valid JSON."""
 
 
+REVIEW_PROMPT = """You are a clinical KG reviewer. Review this extracted knowledge graph against the original transcript and improve it.
+
+TRANSCRIPT:
+{transcript}
+
+EXTRACTED KG:
+{kg}
+
+Check for:
+1. Missing entities mentioned in transcript but not in KG
+2. Missing relationships between existing nodes
+3. Any incorrect node or edge types — fix them to ONLY use the allowed types below
+
+## ALLOWED NODE TYPES (use ONLY these, no exceptions):
+- SYMPTOM: Patient-reported or observed symptoms (chest pain, shortness of breath)
+- DIAGNOSIS: Active or suspected conditions (COPD exacerbation, pneumonia)
+- TREATMENT: Medications, therapies, interventions (Aspirin, Metformin, DASH diet)
+- PROCEDURE: Tests, exams, surgeries (ECG, stress test, CT angiography)
+- LOCATION: Body parts and anatomical locations (chest, left arm, heart)
+- MEDICAL_HISTORY: Pre-existing conditions, risk factors (diabetes, smoking)
+- LAB_RESULT: Lab values and vital signs (A1C 7.2%, BP 148/90, BNP elevated)
+
+## ALLOWED EDGE TYPES (use ONLY these, no exceptions):
+- CAUSES: Risk factor causes condition
+- INDICATES: Symptom indicates diagnosis
+- LOCATED_AT: Symptom at body location
+- RULES_OUT: Test rules out condition
+- TAKEN_FOR: Treatment for condition
+- CONFIRMS: Lab/test confirms diagnosis
+
+CRITICAL: Do NOT invent new node or edge types. Map everything to the closest allowed type above.
+
+Return an improved JSON with the same format (nodes + edges). Output ONLY valid JSON."""
+
+
+
 # === Model Client ===
 class OpenRouterClient:
     """Client for OpenRouter API (GLM, etc.)"""
@@ -200,6 +236,36 @@ def extract_naive(transcript: str, client: OpenRouterClient) -> tuple:
         return kg, usage
     return None, usage
 
+def extract_with_reflection(transcript: str, client: OpenRouterClient) -> tuple:
+    """Two-pass extraction with self-critique."""
+    # Pass 1: naive extraction
+    kg, usage1 = extract_naive(transcript, client)
+    if not kg:
+        return None, usage1
+
+    # Pass 2: reflection
+    prompt = REVIEW_PROMPT.format(
+        transcript=transcript,
+        kg=json.dumps(kg, indent=2)
+    )
+    content, usage2 = client.generate(prompt)
+
+    improved_kg = None
+    if content:
+        improved_kg = extract_json_from_response(content)
+        if improved_kg:
+            improved_kg = validate_knowledge_graph(improved_kg)
+
+    # merge usage
+    combined_usage = None
+    if usage1 or usage2:
+        combined_usage = {
+            "prompt_tokens": (usage1 or {}).get("prompt_tokens", 0) + (usage2 or {}).get("prompt_tokens", 0),
+            "completion_tokens": (usage1 or {}).get("completion_tokens", 0) + (usage2 or {}).get("completion_tokens", 0),
+        }
+
+    return improved_kg or kg, combined_usage
+
 
 def process_one(txt_path: Path, client: OpenRouterClient, output_dir: Path, suffix: str) -> tuple:
     """Process single transcript."""
@@ -213,7 +279,7 @@ def process_one(txt_path: Path, client: OpenRouterClient, output_dir: Path, suff
     try:
         transcript = read_transcript(txt_path)
         print(f"  {res_id}...", end=" ", flush=True)
-        kg, usage = extract_naive(transcript, client)
+        kg, usage = extract_with_reflection(transcript, client)
 
         if not kg:
             print("FAILED")
@@ -301,3 +367,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

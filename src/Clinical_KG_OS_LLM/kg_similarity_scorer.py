@@ -290,6 +290,64 @@ def compute_similarity(student_kg: dict, baseline_kg: dict) -> dict:
         'per_patient_coverage': patient_coverage
     }
 
+def per_type_overlap(student_kg, baseline_kg):
+    '''Calculate per node recall precesion'''
+    from collections import defaultdict
+    
+    # group nodes by type
+    student_by_type = defaultdict(set)
+    baseline_by_type = defaultdict(set)
+    
+    for n in student_kg.get('nodes', []):
+        student_by_type[n.get('type', 'UNKNOWN')].add(normalize_text(n['text']))
+    
+    for n in baseline_kg.get('nodes', []):
+        baseline_by_type[n.get('type', 'UNKNOWN')].add(normalize_text(n['text']))
+    
+    all_types = set(student_by_type.keys()) | set(baseline_by_type.keys())
+    
+    for t in sorted(all_types):
+        result = fuzzy_node_overlap(student_by_type[t], baseline_by_type[t])
+        print(f"{t:20s} P:{result['precision']:.2f} R:{result['recall']:.2f} F1:{result['f1']:.2f} (s:{result['student_total']} b:{result['baseline_total']})")
+
+
+def per_edge_type_overlap(student_kg, baseline_kg):
+    '''Calculate per edge recall precision'''
+    from collections import defaultdict
+    
+    id_to_text_s = {n['id']: normalize_text(n['text']) for n in student_kg.get('nodes', [])}
+    id_to_text_b = {n['id']: normalize_text(n['text']) for n in baseline_kg.get('nodes', [])}
+    
+    student_by_type = defaultdict(set)
+    baseline_by_type = defaultdict(set)
+    
+    for e in student_kg.get('edges', []):
+        etype = e.get('type', 'UNKNOWN').upper()
+        src = id_to_text_s.get(e['source_id'], '')
+        tgt = id_to_text_s.get(e['target_id'], '')
+        if src and tgt:
+            student_by_type[etype].add((src, tgt))
+    
+    for e in baseline_kg.get('edges', []):
+        etype = e.get('type', 'UNKNOWN').upper()
+        src = id_to_text_b.get(e['source_id'], '')
+        tgt = id_to_text_b.get(e['target_id'], '')
+        if src and tgt:
+            baseline_by_type[etype].add((src, tgt))
+    
+    all_types = set(student_by_type.keys()) | set(baseline_by_type.keys())
+    
+    for t in sorted(all_types):
+        s = student_by_type[t]
+        b = baseline_by_type[t]
+        matched = sum(1 for se in s if any(
+            fuzzy_match(se[0], be[0]) and fuzzy_match(se[1], be[1]) for be in b
+        ))
+        precision = matched / len(s) if s else 0
+        recall = matched / len(b) if b else 0
+        f1 = 2*precision*recall/(precision+recall) if (precision+recall) > 0 else 0
+        print(f"{t:20s} P:{precision:.2f} R:{recall:.2f} F1:{f1:.2f} (s:{len(s)} b:{len(b)})")
+
 
 def print_report(result: dict, student_path: str, baseline_path: str):
     """Print formatted report."""
@@ -349,22 +407,52 @@ def print_report(result: dict, student_path: str, baseline_path: str):
     print('=' * 70)
 
 
+def filter_kg_by_res_id(kg: dict, res_id: str) -> dict:
+    """Return a copy of kg containing only nodes/edges for the given res_id."""
+    kept_nodes = [
+        n for n in kg.get('nodes', [])
+        if any(occ.get('res_id') == res_id for occ in n.get('occurrences', []))
+    ]
+    kept_ids = {n['id'] for n in kept_nodes}
+    kept_edges = [
+        e for e in kg.get('edges', [])
+        if e.get('source_id') in kept_ids and e.get('target_id') in kept_ids
+    ]
+    return {'nodes': kept_nodes, 'edges': kept_edges}
+
+
 def main():
     parser = argparse.ArgumentParser(description='KG Similarity Scorer')
     parser.add_argument('--student', type=str, required=True, help='Path to student KG JSON')
     parser.add_argument('--baseline', type=str, default=DEFAULT_BASELINE, help='Path to baseline KG JSON')
     parser.add_argument('--output', type=str, default=None, help='Output JSON report path')
+    parser.add_argument('--res-id', type=str, default=None, help='Score only this transcript (e.g. RES0198)')
     args = parser.parse_args()
 
     # Load KGs
     student_kg = load_kg(args.student)
     baseline_kg = load_kg(args.baseline)
 
+    if args.res_id:
+        student_kg = filter_kg_by_res_id(student_kg, args.res_id)
+        baseline_kg = filter_kg_by_res_id(baseline_kg, args.res_id)
+        if not student_kg['nodes']:
+            print(f"Warning: no nodes found for res_id '{args.res_id}' in student KG")
+        if not baseline_kg['nodes']:
+            print(f"Warning: no nodes found for res_id '{args.res_id}' in baseline KG")
+
     # Compute similarity
     result = compute_similarity(student_kg, baseline_kg)
 
     # Print report
     print_report(result, args.student, args.baseline)
+
+    # Print per node/edge score
+    print("\nPer-Type Node Overlap:")
+    per_type_overlap(student_kg, baseline_kg)
+    
+    print("\nPer-Type Edge Overlap:")
+    per_edge_type_overlap(student_kg, baseline_kg)
 
     # Save JSON if requested
     if args.output:
@@ -375,3 +463,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
