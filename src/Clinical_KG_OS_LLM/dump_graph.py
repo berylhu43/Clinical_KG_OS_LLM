@@ -38,7 +38,7 @@ def find_sub_kg_files(input_dir: Path) -> list:
     """Find all sub-KG JSON files in the input directory."""
     files = []
     for f in sorted(input_dir.glob("RES*.json")):
-        if f.name.startswith("RES") and not f.name.startswith("_"):
+        if f.name.startswith("RES") and "debug" not in f.name:
             files.append(f)
     return files
 

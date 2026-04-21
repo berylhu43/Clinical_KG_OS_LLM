@@ -16,3 +16,6 @@ __pycache__/
 # Embeddings cache (large files)
 *.npz
 embeddings_cache/
+
+# claude
+.claude/

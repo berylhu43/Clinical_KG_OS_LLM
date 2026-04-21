@@ -99,12 +99,20 @@ VALIDATE_EDGE_TOOL = {
     }
 }
 
-GET_LONGEST_DOCTOR_TURN_TOOL = {
+PROPOSE_NODE_TOOL = {
     "type": "function",
     "function": {
-        "name": "get_longest_doctor_turn",
-        "description": "Returns the longest doctor turn in the transcript — typically the assessment/plan containing diagnoses, treatments and procedures.",
-        "parameters": {"type": "object", "properties": {}, "required": []}
+        "name": "propose_node",
+        "description": "Propose adding a new node needed for an edge but missing from the node list. Python verifies it exists in the transcript before adding. Returns the new node ID if added, or status 'not_found' if absent from transcript.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The node text to add"},
+                "type": {"type": "string", "description": "Node type: SYMPTOM, DIAGNOSIS, TREATMENT, PROCEDURE, LOCATION, MEDICAL_HISTORY, LAB_RESULT"},
+                "reason": {"type": "string", "description": "Which edge this node is needed for"}
+            },
+            "required": ["text", "type", "reason"]
+        }
     }
 }
 
@@ -293,7 +301,6 @@ def get_longest_doctor_turn(transcript: str) -> dict:
 TRANSCRIPT_DIR = transcripts_dir()
 MAX_RETRIES = 3
 OPENROUTER_MODEL = "z-ai/glm-4.7-flash"
-OUTPUT_SUFFIX = "naive_glm"
 
 # === Prompts ===
 EXTRACTION_PROMPT = """Extract clinical knowledge graph from transcript.
@@ -339,15 +346,8 @@ NODE_EXTRACTION_PROMPT = """You are an experienced clinical physician reviewing 
 
 ## RULES:
 - Extract only what is clinically significant — a doctor would document it
-- Use lowercase, short canonical text matching standard clinical terminology
 - Do NOT extract vague phrases like "feeling unwell" — use the specific symptom name
-- Do NOT extract denied/absent symptoms — these belong as edge relations, not nodes
-- Preserve clinical qualifiers in symptom text (e.g. "dry cough" not "cough")
-- For DIAGNOSIS nodes: use the full standard name with qualifiers (e.g. "covid-19" not "covid", "viral illness" not "virus"). Extract ALL diagnoses in the assessment including differentials ("could be X", "if not X")
-- For PROCEDURE nodes: include what is being tested (e.g. "covid swab" not "swab", "nasal swab" not "swab")
-- For TREATMENT nodes: extract the clinical noun concept, not the activity phrasing (e.g. "hydration" not "well hydrated", "self-isolation" not "isolate for 14 days", "nutrition" not "eating nutritious food", "rest" not "sleeping well", "analgesics" not "taking Tylenol for pain")
-- For MEDICAL_HISTORY: extract lifestyle facts inferred from negative answers (patient says "no" to smoking → extract "non-smoker"; says "I'm pretty healthy, no conditions" → extract "no chronic conditions"). Extract substance use facts (marijuana use, alcohol use) when confirmed. Do NOT extract immunization status unless a deficiency was noted.
-- The doctor's final assessment turn is information-dense: extract each diagnosis, treatment, and procedure as a separate node
+- Absent symptoms: ONLY extract if the absence meaningfully changes the diagnosis or management (e.g. "absent fever" in a COVID workup, "absent chest pain" in a cardiac presentation). Do NOT extract every denied symptom from a routine review of systems — if the doctor asks a checklist of 10 symptoms and the patient says no to all, extract NONE of them
 
 TRANSCRIPT:
 {transcript}
@@ -369,11 +369,42 @@ For EACH node, call check_node_in_transcript to verify textual support. Use thes
   - For MEDICAL_HISTORY nodes representing a negative state (text starts with "non-", "no ", "never "): patient saying "No" CONFIRMS the node → KEEP
   - Otherwise if confirmed → KEEP
 - No match → call search_transcript with a related keyword to look for supporting context (e.g. for "non-smoker" search "smoke"). If context supports the node as a valid clinical inference → KEEP. If nothing supports it → REMOVE.
-- For SYMPTOM/PROCEDURE: normalize text using the wording from the transcript — keep brand names and colloquial terms as said (e.g. "Tylenol" not "acetaminophen")
-- For TREATMENT nodes: use the clinical noun form — NOT the activity phrasing (e.g. "hydration" not "well hydrated", "self-isolation" not "isolate", "nutrition" not "eating nutritious food", "rest" not "sleeping well")
-- For DIAGNOSIS: use the full standardized disease name as it would appear in a medical record. Expand informal shorthand to the proper clinical name (e.g. "covid-19" not "covid", "influenza" not "flu"). Do not use informal abbreviations even if that is what the transcript says.
-- Keep diagnosis nodes introduced conditionally ("could be", "if not X") — these are valid differentials
-- MEDICAL_HISTORY: only keep lifestyle facts and past conditions that are clinically relevant. Immunization status is not MEDICAL_HISTORY unless the patient is behind on vaccinations — remove it if the patient is up to date.
+
+## CANONICALIZATION — normalize text using the tool evidence:
+
+**SYMPTOM:**
+- Keep qualifiers when clinically meaningful: "dry cough" ≠ "cough"; "productive cough" ≠ "cough"; "pleuritic chest pain" ≠ "chest pain"
+- Do NOT over-split: "diarrhea" is sufficient — remove "liquid stools" if diarrhea already exists; "vomiting" is sufficient — remove "vomiting contents"
+- Absent findings: KEEP only if the absence is clinically meaningful for the suspected diagnosis. REMOVE absent symptoms that come from a routine review of systems checklist (e.g. "absent changes in vision", "absent changes in bowel movements", "absent palpitations" in a respiratory case)
+- Use "absent [symptom]" format: "absent fever", "absent chest pain"
+
+**DIAGNOSIS:**
+- Full clinical name: "covid-19" not "covid"; "copd exacerbation" not "COPD"; "influenza" not "flu"
+- Combine equivalent differentials into one node: "viral infection / common cold" not two nodes
+- Ruled-out: embed in text ("asthma ruled out")
+- Keep all conditionals from assessment ("could be X", "if not X")
+
+**TREATMENT:**
+- Specific name spoken: "Tylenol" not "acetaminophen"; "Ventolin" not "salbutamol"; "Advil" not "ibuprofen"
+- Drug class only when no specific name given: "NSAIDs", "antibiotics", "steroids", "statin"
+- Noun form: "hydration" not "well hydrated"; "isolation" not "isolate for 14 days"
+- Merge duplicate drug nodes: one node per drug regardless of how many reasons it was mentioned
+
+**PROCEDURE:**
+- Name what is tested: "COVID swab" not "swab"; "chest X-ray" not "imaging"; "lyme serology" not "blood test"
+- Physical exam counts: "pulse oximetry", "chest auscultation", "vital signs"
+
+**LOCATION:**
+- Simple anatomical terms only: "chest", "nose", "throat", "forehead", "head"
+- Remove directional qualifiers: "both sides" is NOT a location node
+
+**MEDICAL_HISTORY:**
+- Substance use compound noun: "cannabis use", "alcohol use" — NOT "marijuana use"
+- Exposures compound noun: "daycare exposure", "sick contact exposure", "school exposure"
+- Family history: "family history [condition]" or "family hx [condition] (relation)"
+- REMOVE routine negatives: "no allergies", "no medications", "no recreational drugs", "no family history of X", "healthy", "up to date with immunizations" — these are not clinically actionable
+- REMOVE if it is a generic wellness statement with no diagnostic significance
+- KEEP only if it is a positive finding: active condition, substance use, significant exposure, family history of a condition that affects this patient's management
 
 NODES:
 {nodes}
@@ -435,10 +466,10 @@ Use get_turn(turn_id) and search_transcript(keyword) to retrieve evidence from t
 
 ## KEY RULES:
 - A test ORDERED to exclude a diagnosis → RULES_OUT (not CONFIRMS)
-- INDICATES: only create when the doctor explicitly links a symptom to a specific diagnosis. For alternative/differential diagnoses introduced with "could be" or "if not X", do NOT duplicate INDICATES edges — they share implied symptoms with the primary diagnosis
+- INDICATES: create when the doctor names a specific symptom in the context of discussing a diagnosis — either explicitly ("your cough and SOB suggest COPD") or by listing it as part of the clinical picture. A blanket "your symptoms overlap with X" without naming any specific symptom does NOT justify any INDICATES edges — skip it entirely. For differential diagnoses introduced with "could be" or "if not X", do NOT create INDICATES edges — the primary diagnosis already captures the reasoning.
 - TAKEN_FOR: check BOTH early patient turns (patient-reported medications they are already taking) AND the assessment turn (doctor-recommended treatments). A patient saying "I take Tylenol for my headache" → Tylenol TAKEN_FOR headache. Doctor-recommended supportive care in the assessment → TAKEN_FOR the primary diagnosis.
 - LOCATED_AT: MANDATORY — for EVERY LOCATION node in the list, call search_transcript(location_text) to find which SYMPTOM was being discussed in that context, then create a LOCATED_AT edge from that SYMPTOM to the LOCATION. Do NOT skip any LOCATION node.
-- Use ONLY node IDs listed below — never invent IDs
+- If an edge requires a node not in the list below: call propose_node(text, type, reason) — Python will verify it exists in the transcript and return its new ID. Only use the returned ID if status is "added"
 
 ## SYSTEMATIC NODE CHECKS (do these before finishing):
 1. PROCEDURE nodes: for each, call search_transcript(procedure_text) — find what condition it was ordered to test/exclude → RULES_OUT (ordered to exclude) or CONFIRMS (result confirmed a diagnosis)
@@ -555,11 +586,25 @@ class OpenRouterClient:
         return "", None
 
     def generate_with_tools(self, prompt: str, tools: list, dispatch: callable) -> tuple:
-        """Multi-turn generation with tool calling. dispatch(name, args) -> result dict."""
+        """Multi-turn generation with tool calling. dispatch(name, args) -> result dict.
+
+        Graceful degradation: at WARN_AT iterations inject a stop signal so the model
+        wraps up cleanly. Falls back to last partial assistant output if limit is hit.
+        """
+        LIMIT = 60
+        WARN_AT = LIMIT - 5
+
         messages = [{"role": "user", "content": prompt}]
         total_prompt = total_completion = 0
+        last_content = ""
 
-        for _ in range(30):
+        for i in range(LIMIT):
+            if i == WARN_AT:
+                messages.append({
+                    "role": "user",
+                    "content": "Stop calling tools now. Output your final JSON result immediately."
+                })
+
             try:
                 resp = self.client.chat.completions.create(
                     model=self.model,
@@ -569,13 +614,15 @@ class OpenRouterClient:
                 )
             except Exception as e:
                 print(f"(tool-call error: {e})", end=" ", flush=True)
-                return "", None
+                break
 
             if resp.usage:
                 total_prompt += resp.usage.prompt_tokens or 0
                 total_completion += resp.usage.completion_tokens or 0
 
             msg = resp.choices[0].message
+            if msg.content:
+                last_content = msg.content
             messages.append(msg)
 
             if not msg.tool_calls:
@@ -591,7 +638,11 @@ class OpenRouterClient:
                     "content": json.dumps(result)
                 })
 
-        return "", {"prompt_tokens": total_prompt, "completion_tokens": total_completion}
+        usage = {"prompt_tokens": total_prompt, "completion_tokens": total_completion}
+        if last_content:
+            print("(warn: tool-call limit reached, using last partial output)", end=" ", flush=True)
+            return last_content, usage
+        return "", usage
 
 
 def get_client(api_keys: dict) -> OpenRouterClient:
@@ -710,7 +761,21 @@ def review_nodes_with_tool(nodes: list, transcript: str, client: OpenRouterClien
 
 
 def extract_edges_with_tools(nodes: list, transcript: str, client: OpenRouterClient) -> tuple:
-    """Extract edges using tool-based transcript lookup (no full transcript in prompt)."""
+    """Extract edges using tool-based transcript lookup. Supports propose_node for mid-pass node discovery.
+
+    Returns (edges, proposed_ids, usage) where proposed_ids tracks nodes added via propose_node
+    so the caller can run them through review_nodes_with_tool for type/canonicalization correction.
+    """
+    def _node_num(n):
+        try:
+            return int(n["id"].split("_")[1])
+        except (IndexError, ValueError):
+            return 0
+
+    next_id_ref = [max((_node_num(n) for n in nodes), default=0) + 1]
+    proposed_ids = set()
+    node_map = {n["id"]: n for n in nodes}
+
     nodes_summary = json.dumps(
         [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in nodes],
         indent=2
@@ -722,10 +787,31 @@ def extract_edges_with_tools(nodes: list, transcript: str, client: OpenRouterCli
             return get_turn(args["turn_id"], transcript)
         if name == "search_transcript":
             return search_transcript(args["keyword"], transcript)
+        if name == "propose_node":
+            text = args.get("text", "").strip()
+            node_type = args.get("type", "").upper()
+            # Return existing node if already present
+            for n in nodes:
+                if n["text"].lower() == text.lower() and n["type"] == node_type:
+                    return {"status": "already_exists", "id": n["id"]}
+            result = check_node_in_transcript(text, transcript)
+            if result["matched"]:
+                new_id = f"N_{next_id_ref[0]:03d}"
+                next_id_ref[0] += 1
+                new_node = {
+                    "id": new_id, "text": text, "type": node_type,
+                    "evidence": result.get("evidence") or "",
+                    "turn_id": "",
+                }
+                nodes.append(new_node)
+                node_map[new_id] = new_node
+                proposed_ids.add(new_id)
+                return {"status": "added", "id": new_id}
+            return {"status": "not_found", "message": "not in transcript — do not create edges to this node"}
         return {"error": f"unknown tool: {name}"}
 
     content, usage = client.generate_with_tools(
-        prompt, [GET_TURN_TOOL, SEARCH_TRANSCRIPT_TOOL], dispatch
+        prompt, [GET_TURN_TOOL, SEARCH_TRANSCRIPT_TOOL, PROPOSE_NODE_TOOL], dispatch
     )
 
     if content:
@@ -733,9 +819,9 @@ def extract_edges_with_tools(nodes: list, transcript: str, client: OpenRouterCli
         if isinstance(result, list):
             result = {"edges": result}
         if result and "edges" in result:
-            return result["edges"], usage or {}
+            return result["edges"], proposed_ids, usage or {}
 
-    return [], usage or {}
+    return [], proposed_ids, usage or {}
 
 
 def review_edges_with_tool(nodes: list, edges: list, transcript: str, client: OpenRouterClient) -> tuple:
@@ -799,7 +885,12 @@ def check_assessment_for_nodes(nodes: list, transcript: str, client: OpenRouterC
     if not assessment.get("text"):
         return [], {}
 
-    next_id = max((int(n["id"].split("_")[1]) for n in nodes), default=0) + 1
+    def _node_num(n):
+        try:
+            return int(n["id"].split("_")[1])
+        except (IndexError, ValueError):
+            return 0
+    next_id = max((_node_num(n) for n in nodes), default=0) + 1
     nodes_summary = json.dumps(
         [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in nodes], indent=2
     )
@@ -988,21 +1079,12 @@ def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> 
     reviewed_nodes, usage = review_nodes_with_tool(nodes, transcript, client)
     add_usage(usage)
     reviewed_ids = {n["id"] for n in reviewed_nodes}
-    dropped_nodes = [n for n in nodes if n["id"] not in reviewed_ids]
-
-    # Python post-processing: restore dropped MEDICAL_HISTORY nodes with transcript evidence
-    restored = restore_dropped_medical_history(dropped_nodes, transcript)
-    if restored:
-        reviewed_nodes.extend(restored)
-        reviewed_ids = {n["id"] for n in reviewed_nodes}
 
     debug["pass3_nodes_kept"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in reviewed_nodes]
     debug["pass3_nodes_dropped"] = [
         {"id": n["id"], "text": n["text"], "type": n["type"]}
         for n in nodes if n["id"] not in reviewed_ids
     ]
-    if restored:
-        debug["pass3_nodes_restored"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in restored]
 
     # Dedup nodes with same (text, type) — keeps first occurrence
     seen_node_keys = set()
@@ -1015,9 +1097,26 @@ def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> 
     reviewed_nodes = deduped
 
     # Pass 4: edge extraction — tool-based transcript lookup
-    edges, usage = extract_edges_with_tools(reviewed_nodes, transcript, client)
+    edges, proposed_ids, usage = extract_edges_with_tools(reviewed_nodes, transcript, client)
     add_usage(usage)
+
+    # Pass 4b: review any nodes proposed mid-pass through the same node review gate
+    # (type correction + canonicalization — same logic as Pass 3)
+    if proposed_ids:
+        proposed = [n for n in reviewed_nodes if n["id"] in proposed_ids]
+        reviewed_proposed, usage = review_nodes_with_tool(proposed, transcript, client)
+        add_usage(usage)
+        # Replace proposed nodes with their reviewed versions
+        reviewed_proposed_map = {n["id"]: n for n in reviewed_proposed}
+        reviewed_nodes = [
+            reviewed_proposed_map.get(n["id"], n) if n["id"] in proposed_ids else n
+            for n in reviewed_nodes
+        ]
+
+    # Rebuild node_map after propose_node mutations and Pass 4b corrections
     node_map = {n["id"]: n for n in reviewed_nodes}
+    if not edges and len(reviewed_nodes) > 5:
+        print("(warn: pass4 0 edges — possible tool-call limit hit)", end=" ", flush=True)
     debug["pass4_edges"] = [
         {
             "source": node_map.get(e.get("source_id"), {}).get("text", e.get("source_id")),
@@ -1170,7 +1269,7 @@ def main():
                         help="Optional list of patient IDs to process (e.g. RES0198 RES0199). Processes all if omitted.")
     parser.add_argument("--method", type=str, default="node_edge",
                         choices=["naive", "reflect", "node_edge"],
-                        help="Extraction method: naive, reflect (2-pass), node_edge (3-pass, default)")
+                        help="Extraction method: naive, reflect (2-pass), node_edge (6-pass, default)")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
