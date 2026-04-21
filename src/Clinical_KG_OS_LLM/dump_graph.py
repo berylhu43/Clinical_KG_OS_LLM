@@ -140,7 +140,7 @@ def entity_resolution(all_raw_entities: list, embed_model, threshold: float) -> 
         # Map to canonical names
         name_to_canonical = {}
         for cluster, sims in clusters:
-            canonical = min(cluster, key=len)
+            canonical = max(cluster, key=len)
             for name in cluster:
                 name_to_canonical[name] = canonical
 

@@ -51,6 +51,12 @@ def print_remaining_credits(api_key: str, base_url: str = BASE_URL) -> None:
 
 def main():
     api_key = os.getenv("API_KEY")
+    if not api_key:
+        import json
+        from pathlib import Path
+        keys_file = Path("api_keys.json")
+        if keys_file.exists():
+            api_key = json.loads(keys_file.read_text()).get("openrouter")
     print_remaining_credits(api_key)
 
 

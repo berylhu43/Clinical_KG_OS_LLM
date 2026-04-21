@@ -417,6 +417,7 @@ def filter_kg_by_res_id(kg: dict, res_id: str) -> dict:
     kept_edges = [
         e for e in kg.get('edges', [])
         if e.get('source_id') in kept_ids and e.get('target_id') in kept_ids
+        and e.get('res_id') == res_id
     ]
     return {'nodes': kept_nodes, 'edges': kept_edges}
 
