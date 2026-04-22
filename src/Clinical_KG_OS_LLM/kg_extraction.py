@@ -15,6 +15,7 @@ import json
 import re
 import argparse
 import time
+from collections import defaultdict
 from pathlib import Path
 
 from Clinical_KG_OS_LLM.paths import transcripts_dir
@@ -118,11 +119,34 @@ PROPOSE_NODE_TOOL = {
 
 
 # === Transcript search utilities ===
-def check_node_in_transcript(node_text: str, transcript: str) -> dict:
+def check_node_in_transcript(node_text: str, transcript: str, index: 'TranscriptIndex' = None) -> dict:
     """Check if node text appears in transcript — exact, partial-word, or stem match.
     When the match is in a doctor question turn, includes the patient's reply so the
     reviewer can detect negated mentions (e.g. 'joint pains? ... Uh no.')."""
     check_text = re.sub(r'^absent\s+', '', node_text.lower().strip())
+
+    if index is not None:
+        candidates = index.matching_turns(check_text)
+        if candidates:
+            for turn_id in index.turn_order:
+                if turn_id not in candidates:
+                    continue
+                block = index.turn_block[turn_id]
+                if check_text in block.lower():
+                    if turn_id.startswith('D-'):
+                        turn_num = turn_id.split('-')[1]
+                        d_text = index.turn_text.get(f"D-{turn_num}", "")
+                        p_text = index.turn_text.get(f"P-{turn_num}", "")
+                        evidence = f"[D-{turn_num}] {d_text}"
+                        if p_text:
+                            evidence += f"  →  [P-{turn_num}] {p_text}"
+                    else:
+                        char_pos = block.lower().find(check_text)
+                        evidence = block[max(0, char_pos - 40):char_pos + len(check_text) + 40].strip()
+                    return {"matched": True, "match_type": "exact", "evidence": evidence}
+            return {"matched": True, "match_type": "partial_words", "evidence": None}
+        return {"matched": False, "match_type": "none", "evidence": None}
+
     trans_lower = transcript.lower()
 
     if check_text in trans_lower:
@@ -160,8 +184,13 @@ def check_node_in_transcript(node_text: str, transcript: str) -> dict:
     return {"matched": False, "match_type": "none", "evidence": None}
 
 
-def get_turn(turn_id: str, transcript: str) -> dict:
+def get_turn(turn_id: str, transcript: str, index: 'TranscriptIndex' = None) -> dict:
     """Return full text of a transcript turn by ID."""
+    if index is not None:
+        text = index.turn_text.get(turn_id)
+        if text is not None:
+            return {"turn_id": turn_id, "text": text}
+        return {"turn_id": turn_id, "text": None, "error": "turn not found"}
     pattern = rf'\[{re.escape(turn_id)}\]\s*[DP]:\s*(.+?)(?=\n\n\[|\Z)'
     match = re.search(pattern, transcript, re.DOTALL)
     if match:
@@ -169,8 +198,27 @@ def get_turn(turn_id: str, transcript: str) -> dict:
     return {"turn_id": turn_id, "text": None, "error": "turn not found"}
 
 
-def search_transcript(keyword: str, transcript: str) -> dict:
-    """Return all turns containing a keyword."""
+def search_transcript(keyword: str, transcript: str, index: 'TranscriptIndex' = None, include_adjacent: bool = False) -> dict:
+    """Return all turns containing a keyword. With include_adjacent=True, each result
+    also carries the immediately preceding and following turn blocks for context."""
+    if index is not None:
+        matching = index.matching_turns(keyword)
+        results = []
+        for turn_id in index.turn_order:
+            if turn_id not in matching:
+                continue
+            entry = {"turn_id": turn_id, "text": index.turn_block[turn_id]}
+            if include_adjacent:
+                pos = index.turn_pos[turn_id]
+                adj = []
+                if pos > 0:
+                    adj.append(index.turn_block[index.turn_order[pos - 1]])
+                if pos + 1 < len(index.turn_order):
+                    adj.append(index.turn_block[index.turn_order[pos + 1]])
+                if adj:
+                    entry["adjacent_turns"] = adj
+            results.append(entry)
+        return {"keyword": keyword, "matches": results}
     keyword_lower = keyword.lower()
     results = []
     for block in transcript.split('\n\n'):
@@ -178,6 +226,68 @@ def search_transcript(keyword: str, transcript: str) -> dict:
             m = re.match(r'\[([DP]-\d+)\]', block.strip())
             results.append({"turn_id": m.group(1) if m else None, "text": block.strip()})
     return {"keyword": keyword, "matches": results}
+
+
+class TranscriptIndex:
+    """Pre-built lookup structures for O(1) turn retrieval and keyword search.
+
+    Build once per transcript; pass into dispatch closures so the LLM tool
+    handlers skip the O(T) scan on every call.
+    """
+
+    def __init__(self, transcript: str):
+        self.transcript = transcript
+        self.turn_order: list = []       # turn_ids in document order
+        self.turn_pos: dict = {}         # turn_id → position in turn_order
+        self.turn_text: dict = {}        # turn_id → text only (no marker prefix)
+        self.turn_block: dict = {}       # turn_id → full raw block
+        self._inv: dict = {}             # token/stem → set of turn_ids
+        self._build(transcript)
+
+    @staticmethod
+    def _stem(s: str) -> str:
+        return s[:max(4, len(s) - 2)] if len(s) > 5 else s
+
+    def _build(self, transcript: str):
+        inv: dict = defaultdict(set)
+        for block in transcript.split('\n\n'):
+            block = block.strip()
+            if not block:
+                continue
+            m = re.match(r'\[([DP]-\d+)\]', block)
+            if not m:
+                continue
+            turn_id = m.group(1)
+            tm = re.match(r'\[[DP]-\d+\]\s*[DP]:\s*(.+)', block, re.DOTALL)
+            text = tm.group(1).strip() if tm else block
+
+            pos = len(self.turn_order)
+            self.turn_order.append(turn_id)
+            self.turn_pos[turn_id] = pos
+            self.turn_text[turn_id] = text
+            self.turn_block[turn_id] = block
+
+            for tok in re.findall(r'\b[a-z0-9]{3,}\b', block.lower()):
+                inv[tok].add(turn_id)
+                stem = self._stem(tok)
+                if stem != tok:
+                    inv[stem].add(turn_id)
+        self._inv = dict(inv)
+
+    def matching_turns(self, phrase: str) -> set:
+        """Return turn_ids where every token of phrase appears (exact or stem)."""
+        tokens = re.findall(r'\b[a-z0-9]{3,}\b', phrase.lower())
+        if not tokens:
+            return set()
+        sets = []
+        for tok in tokens:
+            stem = self._stem(tok)
+            s = self._inv.get(tok, set()) | self._inv.get(stem, set())
+            sets.append(s)
+        result = sets[0].copy()
+        for s in sets[1:]:
+            result &= s
+        return result
 
 
 # Edge type patterns derived from human-curated KG ground truth
@@ -214,7 +324,7 @@ def validate_edge_type(source_type: str, target_type: str) -> dict:
     }
 
 
-def check_edge_evidence(source_text: str, target_text: str, edge_type: str, transcript: str) -> dict:
+def check_edge_evidence(source_text: str, target_text: str, edge_type: str, transcript: str, index: 'TranscriptIndex' = None) -> dict:
     """Find turns where source and target co-occur (same turn or adjacent turns).
 
     For INDICATES/CONFIRMS/RULES_OUT: symptoms are discussed in early turns and
@@ -224,6 +334,44 @@ def check_edge_evidence(source_text: str, target_text: str, edge_type: str, tran
 
     Uses stem matching so 'isolation' matches 'isolate', 'hydration' matches 'hydrated'.
     """
+    if index is not None:
+        src_turns = index.matching_turns(source_text)
+        tgt_turns = index.matching_turns(target_text)
+        matches = []
+
+        same = src_turns & tgt_turns
+        for turn_id in index.turn_order:
+            if turn_id in same:
+                matches.append({"turn_id": turn_id, "text": index.turn_block[turn_id], "same_turn": True})
+
+        for turn_id in index.turn_order:
+            if turn_id not in src_turns or turn_id in same:
+                continue
+            pos = index.turn_pos[turn_id]
+            for ni in (pos - 1, pos + 1):
+                if 0 <= ni < len(index.turn_order):
+                    n_id = index.turn_order[ni]
+                    if n_id in tgt_turns:
+                        matches.append({
+                            "turn_id": turn_id,
+                            "text": index.turn_block[turn_id] + "\n" + index.turn_block[n_id],
+                            "same_turn": False,
+                        })
+                        break
+
+        if not matches and edge_type in ("INDICATES", "CONFIRMS", "RULES_OUT"):
+            assessment = get_longest_doctor_turn(transcript, index)
+            if src_turns and assessment.get("turn_id") in tgt_turns:
+                matches.append({
+                    "turn_id": assessment.get("turn_id"),
+                    "text": f"['{source_text}' mentioned in transcript history; '{target_text}' confirmed in assessment {assessment.get('turn_id')}]",
+                    "same_turn": False,
+                    "inferred": True,
+                })
+
+        return {"source": source_text, "target": target_text, "edge_type": edge_type,
+                "evidence_found": bool(matches), "matches": matches}
+
     src_lower = source_text.lower()
     tgt_lower = target_text.lower()
 
@@ -264,8 +412,6 @@ def check_edge_evidence(source_text: str, target_text: str, edge_type: str, tran
                     "same_turn": False
                 })
 
-    # Fallback for relationships that span history → assessment:
-    # source (symptom/finding) mentioned anywhere + target (diagnosis) in assessment.
     if not matches and edge_type in ("INDICATES", "CONFIRMS", "RULES_OUT"):
         src_anywhere = any(found_in(b, src_lower, src_stem) for b in blocks)
         assessment = get_longest_doctor_turn(transcript)
@@ -287,8 +433,17 @@ def check_edge_evidence(source_text: str, target_text: str, edge_type: str, tran
     }
 
 
-def get_longest_doctor_turn(transcript: str) -> dict:
+def get_longest_doctor_turn(transcript: str, index: 'TranscriptIndex' = None) -> dict:
     """Return the longest doctor turn — typically the assessment/plan."""
+    if index is not None:
+        best_id, best_text, best_len = None, "", 0
+        for turn_id in index.turn_order:
+            if not turn_id.startswith('D-'):
+                continue
+            text = index.turn_text[turn_id]
+            if len(text) > best_len:
+                best_id, best_text, best_len = turn_id, text, len(text)
+        return {"turn_id": best_id, "text": best_text}
     best = {"turn_id": None, "text": "", "length": 0}
     for m in re.finditer(r'\[D-(\d+)\]\s*D:\s*(.+?)(?=\n\n\[|\Z)', transcript, re.DOTALL):
         text = m.group(2).strip()
@@ -354,7 +509,9 @@ NODE_EXTRACTION_PROMPT = """You are an experienced clinical physician reviewing 
 - For PROCEDURE nodes: include what is being tested (e.g. "covid swab" not "swab", "nasal swab" not "swab")
 - For TREATMENT nodes: extract the clinical noun concept, not the activity phrasing (e.g. "hydration" not "well hydrated", "self-isolation" not "isolate for 14 days", "nutrition" not "eating nutritious food", "rest" not "sleeping well", "analgesics" not "taking Tylenol for pain")
 - For MEDICAL_HISTORY: extract lifestyle facts inferred from negative answers (patient says "no" to smoking → extract "non-smoker"; says "I'm pretty healthy, no conditions" → extract "no chronic conditions"). Extract substance use facts (marijuana use, alcohol use) when confirmed. Do NOT extract immunization status unless a deficiency was noted.
-- The doctor's final assessment turn is information-dense: extract each diagnosis, treatment, and procedure as a separate node
+- For LOCATION nodes: single lowercase anatomical term matching transcript wording (e.g. "chest", "left arm", "throat"). One location per node — do not combine multiple body parts.
+- For LAB_RESULT nodes: always include the measured value with units (e.g. "A1C 7.2%", "BP 148/90", "temperature 101°F"). Do not extract a lab name without its value.
+- The doctor's final assessment turn is information-dense: extract each diagnosis, treatment, procedure, and lab result as a separate node
 
 TRANSCRIPT:
 {transcript}
@@ -444,13 +601,16 @@ Use get_turn(turn_id) and search_transcript(keyword) to retrieve evidence from t
 - A test ORDERED to exclude a diagnosis → RULES_OUT (not CONFIRMS)
 - INDICATES: only create when the doctor explicitly links a symptom to a specific diagnosis. For alternative/differential diagnoses introduced with "could be" or "if not X", do NOT duplicate INDICATES edges — they share implied symptoms with the primary diagnosis
 - TAKEN_FOR: check BOTH early patient turns (patient-reported medications they are already taking) AND the assessment turn (doctor-recommended treatments). A patient saying "I take Tylenol for my headache" → Tylenol TAKEN_FOR headache. Doctor-recommended supportive care in the assessment → TAKEN_FOR the primary diagnosis.
-- LOCATED_AT: MANDATORY — for EVERY LOCATION node in the list, call search_transcript(location_text) to find which SYMPTOM was being discussed in that context, then create a LOCATED_AT edge from that SYMPTOM to the LOCATION. Do NOT skip any LOCATION node.
+- LOCATED_AT: symptom → body location. Mandatory for every LOCATION node — see systematic check #4 below.
 - If an edge requires a node not in the list below: call propose_node(text, type, reason) — Python will verify it exists in the transcript and return its new ID. Only use the returned ID if status is "added"
 
 ## SYSTEMATIC NODE CHECKS (do these before finishing):
 1. PROCEDURE nodes: for each, call search_transcript(procedure_text) — find what condition it was ordered to test/exclude → RULES_OUT (ordered to exclude) or CONFIRMS (result confirmed a diagnosis)
 2. TREATMENT nodes: for each, verify you have a TAKEN_FOR edge. If missing, call search_transcript(treatment_text) to find what condition/symptom it was given for → TAKEN_FOR
 3. MEDICAL_HISTORY nodes: for each, check if it CAUSES any DIAGNOSIS node — call search_transcript(history_text) if needed
+4. LOCATION nodes: for each, call search_transcript(location_text) — find which SYMPTOM node was being discussed in that context → LOCATED_AT (mandatory, do NOT skip)
+5. SYMPTOM nodes: for each, call search_transcript(symptom_text) — find the doctor's assessment turn where a specific diagnosis is named alongside it → INDICATES. Only add if the doctor explicitly links this symptom to a named diagnosis; check adjacent_turns in the result for context.
+6. LAB_RESULT nodes: for each, call search_transcript(lab_text) — find the diagnosis the doctor links the result to → CONFIRMS
 
 NODES:
 {nodes}
@@ -706,6 +866,7 @@ def get_transcript_files():
 
 def review_nodes_with_tool(nodes: list, transcript: str, client: OpenRouterClient) -> tuple:
     """Review extracted nodes using tool-based transcript verification."""
+    idx = TranscriptIndex(transcript)
     nodes_json = json.dumps(
         [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in nodes],
         indent=2
@@ -714,9 +875,9 @@ def review_nodes_with_tool(nodes: list, transcript: str, client: OpenRouterClien
 
     def dispatch(name, args):
         if name == "check_node_in_transcript":
-            return check_node_in_transcript(args["node_text"], transcript)
+            return check_node_in_transcript(args["node_text"], transcript, index=idx)
         if name == "search_transcript":
-            return search_transcript(args["keyword"], transcript)
+            return search_transcript(args["keyword"], transcript, index=idx)
         return {"error": f"unknown tool: {name}"}
 
     content, usage = client.generate_with_tools(prompt, [CHECK_NODE_TOOL, SEARCH_TRANSCRIPT_TOOL], dispatch)
@@ -742,6 +903,8 @@ def extract_edges_with_tools(nodes: list, transcript: str, client: OpenRouterCli
     Returns (edges, proposed_ids, usage) where proposed_ids tracks nodes added via propose_node
     so the caller can run them through review_nodes_with_tool for type/canonicalization correction.
     """
+    idx = TranscriptIndex(transcript)
+
     def _node_num(n):
         try:
             return int(n["id"].split("_")[1])
@@ -760,9 +923,10 @@ def extract_edges_with_tools(nodes: list, transcript: str, client: OpenRouterCli
 
     def dispatch(name, args):
         if name == "get_turn":
-            return get_turn(args["turn_id"], transcript)
+            return get_turn(args["turn_id"], transcript, index=idx)
         if name == "search_transcript":
-            return search_transcript(args["keyword"], transcript)
+            # include_adjacent=True so the LLM sees neighboring turns for relationship context
+            return search_transcript(args["keyword"], transcript, index=idx, include_adjacent=True)
         if name == "propose_node":
             text = args.get("text", "").strip()
             node_type = args.get("type", "").upper()
@@ -770,7 +934,7 @@ def extract_edges_with_tools(nodes: list, transcript: str, client: OpenRouterCli
             for n in nodes:
                 if n["text"].lower() == text.lower() and n["type"] == node_type:
                     return {"status": "already_exists", "id": n["id"]}
-            result = check_node_in_transcript(text, transcript)
+            result = check_node_in_transcript(text, transcript, index=idx)
             if result["matched"]:
                 new_id = f"N_{next_id_ref[0]:03d}"
                 next_id_ref[0] += 1
@@ -802,6 +966,7 @@ def extract_edges_with_tools(nodes: list, transcript: str, client: OpenRouterCli
 
 def review_edges_with_tool(nodes: list, edges: list, transcript: str, client: OpenRouterClient) -> tuple:
     """Review extracted edges using validate_edge_type and check_edge_evidence tools."""
+    idx = TranscriptIndex(transcript)
     node_map = {n["id"]: n for n in nodes}
 
     # Enrich edges with node text/type so the agent can call tools without extra lookups
@@ -828,7 +993,7 @@ def review_edges_with_tool(nodes: list, edges: list, transcript: str, client: Op
 
     def dispatch(name, args):
         if name == "check_edge_evidence":
-            return check_edge_evidence(args["source_text"], args["target_text"], args["edge_type"], transcript)
+            return check_edge_evidence(args["source_text"], args["target_text"], args["edge_type"], transcript, index=idx)
         if name == "validate_edge_type":
             return validate_edge_type(args["source_type"], args["target_type"])
         return {"error": f"unknown tool: {name}"}
