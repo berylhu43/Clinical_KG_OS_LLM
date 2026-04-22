@@ -346,8 +346,15 @@ NODE_EXTRACTION_PROMPT = """You are an experienced clinical physician reviewing 
 
 ## RULES:
 - Extract only what is clinically significant — a doctor would document it
+- Use lowercase, short canonical text matching standard clinical terminology
 - Do NOT extract vague phrases like "feeling unwell" — use the specific symptom name
-- Absent symptoms: ONLY extract if the absence meaningfully changes the diagnosis or management (e.g. "absent fever" in a COVID workup, "absent chest pain" in a cardiac presentation). Do NOT extract every denied symptom from a routine review of systems — if the doctor asks a checklist of 10 symptoms and the patient says no to all, extract NONE of them
+- Do NOT extract denied/absent symptoms — these belong as edge relations, not nodes
+- Preserve clinical qualifiers in symptom text (e.g. "dry cough" not "cough")
+- For DIAGNOSIS nodes: use the full standard name with qualifiers (e.g. "covid-19" not "covid", "viral illness" not "virus"). Extract ALL diagnoses in the assessment including differentials ("could be X", "if not X")
+- For PROCEDURE nodes: include what is being tested (e.g. "covid swab" not "swab", "nasal swab" not "swab")
+- For TREATMENT nodes: extract the clinical noun concept, not the activity phrasing (e.g. "hydration" not "well hydrated", "self-isolation" not "isolate for 14 days", "nutrition" not "eating nutritious food", "rest" not "sleeping well", "analgesics" not "taking Tylenol for pain")
+- For MEDICAL_HISTORY: extract lifestyle facts inferred from negative answers (patient says "no" to smoking → extract "non-smoker"; says "I'm pretty healthy, no conditions" → extract "no chronic conditions"). Extract substance use facts (marijuana use, alcohol use) when confirmed. Do NOT extract immunization status unless a deficiency was noted.
+- The doctor's final assessment turn is information-dense: extract each diagnosis, treatment, and procedure as a separate node
 
 TRANSCRIPT:
 {transcript}
@@ -369,42 +376,11 @@ For EACH node, call check_node_in_transcript to verify textual support. Use thes
   - For MEDICAL_HISTORY nodes representing a negative state (text starts with "non-", "no ", "never "): patient saying "No" CONFIRMS the node → KEEP
   - Otherwise if confirmed → KEEP
 - No match → call search_transcript with a related keyword to look for supporting context (e.g. for "non-smoker" search "smoke"). If context supports the node as a valid clinical inference → KEEP. If nothing supports it → REMOVE.
-
-## CANONICALIZATION — normalize text using the tool evidence:
-
-**SYMPTOM:**
-- Keep qualifiers when clinically meaningful: "dry cough" ≠ "cough"; "productive cough" ≠ "cough"; "pleuritic chest pain" ≠ "chest pain"
-- Do NOT over-split: "diarrhea" is sufficient — remove "liquid stools" if diarrhea already exists; "vomiting" is sufficient — remove "vomiting contents"
-- Absent findings: KEEP only if the absence is clinically meaningful for the suspected diagnosis. REMOVE absent symptoms that come from a routine review of systems checklist (e.g. "absent changes in vision", "absent changes in bowel movements", "absent palpitations" in a respiratory case)
-- Use "absent [symptom]" format: "absent fever", "absent chest pain"
-
-**DIAGNOSIS:**
-- Full clinical name: "covid-19" not "covid"; "copd exacerbation" not "COPD"; "influenza" not "flu"
-- Combine equivalent differentials into one node: "viral infection / common cold" not two nodes
-- Ruled-out: embed in text ("asthma ruled out")
-- Keep all conditionals from assessment ("could be X", "if not X")
-
-**TREATMENT:**
-- Specific name spoken: "Tylenol" not "acetaminophen"; "Ventolin" not "salbutamol"; "Advil" not "ibuprofen"
-- Drug class only when no specific name given: "NSAIDs", "antibiotics", "steroids", "statin"
-- Noun form: "hydration" not "well hydrated"; "isolation" not "isolate for 14 days"
-- Merge duplicate drug nodes: one node per drug regardless of how many reasons it was mentioned
-
-**PROCEDURE:**
-- Name what is tested: "COVID swab" not "swab"; "chest X-ray" not "imaging"; "lyme serology" not "blood test"
-- Physical exam counts: "pulse oximetry", "chest auscultation", "vital signs"
-
-**LOCATION:**
-- Simple anatomical terms only: "chest", "nose", "throat", "forehead", "head"
-- Remove directional qualifiers: "both sides" is NOT a location node
-
-**MEDICAL_HISTORY:**
-- Substance use compound noun: "cannabis use", "alcohol use" — NOT "marijuana use"
-- Exposures compound noun: "daycare exposure", "sick contact exposure", "school exposure"
-- Family history: "family history [condition]" or "family hx [condition] (relation)"
-- REMOVE routine negatives: "no allergies", "no medications", "no recreational drugs", "no family history of X", "healthy", "up to date with immunizations" — these are not clinically actionable
-- REMOVE if it is a generic wellness statement with no diagnostic significance
-- KEEP only if it is a positive finding: active condition, substance use, significant exposure, family history of a condition that affects this patient's management
+- For SYMPTOM/PROCEDURE: normalize text using the wording from the transcript — keep brand names and colloquial terms as said (e.g. "Tylenol" not "acetaminophen")
+- For TREATMENT nodes: use the clinical noun form — NOT the activity phrasing (e.g. "hydration" not "well hydrated", "self-isolation" not "isolate", "nutrition" not "eating nutritious food", "rest" not "sleeping well")
+- For DIAGNOSIS: use the full standardized disease name as it would appear in a medical record. Expand informal shorthand to the proper clinical name (e.g. "covid-19" not "covid", "influenza" not "flu"). Do not use informal abbreviations even if that is what the transcript says.
+- Keep diagnosis nodes introduced conditionally ("could be", "if not X") — these are valid differentials
+- MEDICAL_HISTORY: only keep lifestyle facts and past conditions that are clinically relevant. Immunization status is not MEDICAL_HISTORY unless the patient is behind on vaccinations — remove it if the patient is up to date.
 
 NODES:
 {nodes}
@@ -466,7 +442,7 @@ Use get_turn(turn_id) and search_transcript(keyword) to retrieve evidence from t
 
 ## KEY RULES:
 - A test ORDERED to exclude a diagnosis → RULES_OUT (not CONFIRMS)
-- INDICATES: create when the doctor names a specific symptom in the context of discussing a diagnosis — either explicitly ("your cough and SOB suggest COPD") or by listing it as part of the clinical picture. A blanket "your symptoms overlap with X" without naming any specific symptom does NOT justify any INDICATES edges — skip it entirely. For differential diagnoses introduced with "could be" or "if not X", do NOT create INDICATES edges — the primary diagnosis already captures the reasoning.
+- INDICATES: only create when the doctor explicitly links a symptom to a specific diagnosis. For alternative/differential diagnoses introduced with "could be" or "if not X", do NOT duplicate INDICATES edges — they share implied symptoms with the primary diagnosis
 - TAKEN_FOR: check BOTH early patient turns (patient-reported medications they are already taking) AND the assessment turn (doctor-recommended treatments). A patient saying "I take Tylenol for my headache" → Tylenol TAKEN_FOR headache. Doctor-recommended supportive care in the assessment → TAKEN_FOR the primary diagnosis.
 - LOCATED_AT: MANDATORY — for EVERY LOCATION node in the list, call search_transcript(location_text) to find which SYMPTOM was being discussed in that context, then create a LOCATED_AT edge from that SYMPTOM to the LOCATION. Do NOT skip any LOCATION node.
 - If an edge requires a node not in the list below: call propose_node(text, type, reason) — Python will verify it exists in the transcript and return its new ID. Only use the returned ID if status is "added"
@@ -1245,15 +1221,13 @@ def process_one(txt_path: Path, client: OpenRouterClient, output_dir: Path, suff
         p2a = len(debug.get("pass2_nodes_added", []))
         p3k = len(debug.get("pass3_nodes_kept", []))
         p3d = len(debug.get("pass3_nodes_dropped", []))
-        p3r = len(debug.get("pass3_nodes_restored", []))
         p4 = len(debug.get("pass4_edges", []))
         p5a = len(debug.get("pass5_edges_added", []))
         p6k = len(debug.get("pass6_edges_kept", []))
         p6d = len(debug.get("pass6_edges_dropped", []))
         assess_n = f" +{p2a}@assess" if p2a else ""
         assess_e = f" +{p5a}@assess" if p5a else ""
-        restore_str = f" +{p3r}restored" if p3r else ""
-        print(f"({n}n/{e}e) | nodes: {p1}{assess_n}→{p3k} (-{p3d}{restore_str}) | edges: {p4}{assess_e}→{p6k} (-{p6d})")
+        print(f"({n}n/{e}e) | nodes: {p1}{assess_n}→{p3k} (-{p3d}) | edges: {p4}{assess_e}→{p6k} (-{p6d})")
         return res_id, "OK", n, e, usage
 
     except Exception as ex:
