@@ -505,7 +505,7 @@ NODE_EXTRACTION_PROMPT = """You are an experienced clinical physician reviewing 
 - For SYMPTOM nodes: use the patient's own qualifying language when clinically meaningful (e.g. "sharp chest pain" not "chest pain", "persistent dry cough" not "cough"). Only extract symptoms the patient confirmed as present — denied symptoms are not nodes. Do NOT extract vague phrases like "feeling unwell" — use the specific symptom name.
 - For DIAGNOSIS nodes: use the full standard name with qualifiers (e.g. "covid-19" not "covid", "viral illness" not "virus"). Extract ALL diagnoses in the assessment including differentials ("could be X", "if not X")
 - For PROCEDURE nodes: include what is being tested (e.g. "covid swab" not "swab", "nasal swab" not "swab")
-- For TREATMENT nodes: extract the clinical noun concept, not the activity phrasing (e.g. "hydration" not "well hydrated", "self-isolation" not "isolate for 14 days", "nutrition" not "eating nutritious food", "rest" not "sleeping well", "analgesics" not "taking Tylenol for pain")
+- For TREATMENT nodes: extract the clinical noun or brand name, not the activity phrasing (e.g. "hydration" not "well hydrated", "self-isolation" not "isolate for 14 days", "rest" not "sleeping well"). When a patient or doctor names a specific drug (Tylenol, Advil, Ventolin), keep that exact name — do not abstract to a drug class like "analgesics" or "antipyretics".
 - For MEDICAL_HISTORY: extract lifestyle facts inferred from negative answers (patient says "no" to smoking → extract "non-smoker"; says "I'm pretty healthy, no conditions" → extract "no chronic conditions"). Extract substance use facts (marijuana use, alcohol use) when confirmed. Do NOT extract immunization status unless a deficiency was noted.
 - For LOCATION nodes: single lowercase anatomical term matching transcript wording (e.g. "chest", "left arm", "throat"). One location per node — do not combine multiple body parts.
 - For LAB_RESULT nodes: always include the measured value with units (e.g. "A1C 7.2%", "BP 148/90", "temperature 101°F"). Do not extract a lab name without its value.
@@ -612,22 +612,22 @@ Use the tools to look up evidence, then output ONLY valid JSON:
 {{"edges": [{{"source_id": "N_001", "target_id": "N_002", "type": "INDICATES", "evidence": "...", "turn_id": "D-52"}}]}}"""
 
 
-EDGE_REVIEW_PROMPT = """You are a senior clinician validating extracted clinical KG edges for correctness.
+EDGE_REVIEW_PROMPT = """You are a senior clinician reviewing extracted clinical KG edges for clinical plausibility.
 
-For EACH edge:
-1. Call validate_edge_type(source_type, target_type) — if the edge type is NOT in the allowed list → REMOVE (hard rule, no exceptions)
-2. Call check_edge_evidence(source_text, target_text, edge_type) — use the result to improve the evidence field:
-   - If co-occurrence found → update evidence with the transcript text from the tool result
-   - If no co-occurrence found but the edge already has a non-empty evidence field → KEEP with the original evidence
-   - If no co-occurrence found AND the edge has no evidence → REMOVE
+Edge schema has already been validated in Python. Your ONLY job is to remove edges that are clinically nonsensical — where the relationship makes no medical sense regardless of transcript content.
 
-NODES (for reference):
-{nodes}
+KEEP an edge unless it clearly fails one of these tests:
+- A negative medical history fact ("non-smoker", "no X", "never X") INDICATES or CAUSES a specific acute diagnosis → REMOVE (a negative fact cannot indicate an infection)
+- An administrative or public health procedure (contact tracing, reporting) INDICATES a diagnosis → REMOVE
+- A treatment CAUSES the exact symptom/condition it was prescribed to treat → REMOVE (prescribing Tylenol does not cause headache)
+- Exact duplicate: same source_id, target_id, and type already appeared earlier in the list → REMOVE the second occurrence
 
-EDGES (each includes source/target text and type for tool calls):
+If an edge has a non-empty evidence field and makes clinical sense → KEEP. Do not second-guess transcript evidence.
+
+EDGES:
 {edges}
 
-Return ONLY valid JSON:
+Return ONLY valid JSON with all kept edges:
 {{"edges": [{{"source_id": "N_001", "target_id": "N_002", "type": "INDICATES", "evidence": "...", "turn_id": "..."}}]}}"""
 
 
@@ -657,6 +657,7 @@ TREATMENT — clinical noun, lowercase. Keep brand names when that is how the tr
   "isolate for 14 days" → "14-day isolation"
   "well hydrated" → "hydration"
   "anti-inflammatories" → "nsaids"
+  "analgesics" → "nsaids"
   "acetaminophen" → "tylenol"
   "ibuprofen" → "advil"
   Keep: "tylenol", "advil", "claritin", "ventolin", "salbutamol", "antibiotics", "steroids", "hydration", "isolation"
@@ -1015,12 +1016,25 @@ def extract_edges_with_tools(nodes: list, transcript: str, client: OpenRouterCli
     return [], proposed_ids, usage or {}
 
 
-def review_edges_with_tool(nodes: list, edges: list, transcript: str, client: OpenRouterClient) -> tuple:
-    """Review extracted edges using validate_edge_type and check_edge_evidence tools."""
-    idx = TranscriptIndex(transcript)
+def schema_filter_edges(edges: list, nodes: list) -> tuple:
+    """Remove edges whose (source_type, target_type, edge_type) is not in VALID_EDGE_PATTERNS.
+    Returns (valid_edges, dropped_edges)."""
     node_map = {n["id"]: n for n in nodes}
+    valid, dropped = [], []
+    for e in edges:
+        src_type = node_map.get(e.get("source_id"), {}).get("type", "").upper()
+        tgt_type = node_map.get(e.get("target_id"), {}).get("type", "").upper()
+        allowed = VALID_EDGE_PATTERNS.get((src_type, tgt_type), [])
+        if e.get("type", "").upper() in allowed:
+            valid.append(e)
+        else:
+            dropped.append(e)
+    return valid, dropped
 
-    # Enrich edges with node text/type so the agent can call tools without extra lookups
+
+def review_edges(nodes: list, edges: list, client: OpenRouterClient) -> tuple:
+    """Clinical plausibility review of schema-valid edges. No tools — schema already validated in Python."""
+    node_map = {n["id"]: n for n in nodes}
     enriched = []
     for e in edges:
         src = node_map.get(e.get("source_id"), {})
@@ -1037,26 +1051,14 @@ def review_edges_with_tool(nodes: list, edges: list, transcript: str, client: Op
             "turn_id": e.get("turn_id", "")
         })
 
-    nodes_summary = json.dumps(
-        [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in nodes], indent=2
-    )
-    prompt = EDGE_REVIEW_PROMPT.format(nodes=nodes_summary, edges=json.dumps(enriched, indent=2))
-
-    def dispatch(name, args):
-        if name == "check_edge_evidence":
-            return check_edge_evidence(args["source_text"], args["target_text"], args["edge_type"], transcript, index=idx)
-        if name == "validate_edge_type":
-            return validate_edge_type(args["source_type"], args["target_type"])
-        return {"error": f"unknown tool: {name}"}
-
-    content, usage = client.generate_with_tools(prompt, [CHECK_EDGE_TOOL, VALIDATE_EDGE_TOOL], dispatch)
+    prompt = EDGE_REVIEW_PROMPT.format(edges=json.dumps(enriched, indent=2))
+    content, usage = client.generate(prompt)
 
     if content:
         result = extract_json_from_response(content)
         if isinstance(result, list):
             result = {"edges": result}
         if result and "edges" in result:
-            # Strip enrichment fields — keep only original edge fields
             clean = []
             for e in result["edges"]:
                 clean.append({
@@ -1285,11 +1287,22 @@ def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> 
         for e in edges
     ]
 
-    # Pass 5: edge review — validate type + verify transcript evidence per edge
-    reviewed_edges, usage = review_edges_with_tool(reviewed_nodes, edges, transcript, client)
+    # Pass 5a: Python schema filter — drop edges not in VALID_EDGE_PATTERNS
+    schema_valid_edges, schema_dropped = schema_filter_edges(edges, reviewed_nodes)
+    debug["pass5a_schema_dropped"] = [
+        {
+            "source": node_map.get(e.get("source_id"), {}).get("text", e.get("source_id")),
+            "target": node_map.get(e.get("target_id"), {}).get("text", e.get("target_id")),
+            "type": e.get("type"),
+        }
+        for e in schema_dropped
+    ]
+
+    # Pass 5b: clinical plausibility review (no tools — schema already validated)
+    reviewed_edges, usage = review_edges(reviewed_nodes, schema_valid_edges, client)
     add_usage(usage)
     kept_edge_keys = {(e.get("source_id"), e.get("target_id"), e.get("type")) for e in reviewed_edges}
-    debug["pass5_edges_kept"] = [
+    debug["pass5b_edges_kept"] = [
         {
             "source": node_map.get(e.get("source_id"), {}).get("text", e.get("source_id")),
             "target": node_map.get(e.get("target_id"), {}).get("text", e.get("target_id")),
@@ -1297,14 +1310,14 @@ def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> 
         }
         for e in reviewed_edges
     ]
-    debug["pass5_edges_dropped"] = [
+    debug["pass5b_edges_dropped"] = [
         {
             "source": node_map.get(e.get("source_id"), {}).get("text", e.get("source_id")),
             "target": node_map.get(e.get("target_id"), {}).get("text", e.get("target_id")),
             "type": e.get("type"),
             "evidence": e.get("evidence", "")[:80],
         }
-        for e in edges
+        for e in schema_valid_edges
         if (e.get("source_id"), e.get("target_id"), e.get("type")) not in kept_edge_keys
     ]
 
@@ -1416,10 +1429,12 @@ def process_one(txt_path: Path, client: OpenRouterClient, output_dir: Path, suff
         p3k = len(debug.get("pass3_nodes_kept", []))
         p3d = len(debug.get("pass3_nodes_dropped", []))
         p4 = len(debug.get("pass4_edges", []))
-        p5k = len(debug.get("pass5_edges_kept", []))
-        p5d = len(debug.get("pass5_edges_dropped", []))
+        p5a_d = len(debug.get("pass5a_schema_dropped", []))
+        p5k = len(debug.get("pass5b_edges_kept", []))
+        p5d = len(debug.get("pass5b_edges_dropped", []))
         assess_n = f" +{p2a}@assess" if p2a else ""
-        print(f"({n}n/{e}e) | nodes: {p1}{assess_n}→{p3k} (-{p3d}) | edges: {p4}→{p5k} (-{p5d})")
+        schema_drop = f" schema-{p5a_d}" if p5a_d else ""
+        print(f"({n}n/{e}e) | nodes: {p1}{assess_n}→{p3k} (-{p3d}) | edges: {p4}{schema_drop}→{p5k} (-{p5d})")
         return res_id, "OK", n, e, usage
 
     except Exception as ex:
