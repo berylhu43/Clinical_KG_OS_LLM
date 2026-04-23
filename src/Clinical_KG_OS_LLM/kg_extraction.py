@@ -530,8 +530,8 @@ For EACH node, call check_node_in_transcript to verify textual support. Use thes
 - Match found in patient turn → KEEP
 - Match found in doctor question turn → check the patient reply in the evidence:
   - For SYMPTOM nodes: if patient denied it (e.g. "No", "not really") → REMOVE
-  - For MEDICAL_HISTORY nodes representing a negative state (text starts with "non-", "no ", "never "): patient saying "No" CONFIRMS the node → KEEP
-  - Otherwise if confirmed → KEEP
+  - For MEDICAL_HISTORY nodes with text starting "non-", "no ", "never ": a "No" answer from the patient IS the evidence — KEEP unconditionally (e.g. "No" to smoking → "non-smoker" is valid; "No" to medications → "no medications" is valid)
+  - Otherwise if patient confirmed → KEEP
 - No match → call search_transcript with a related keyword to find supporting context (e.g. for "non-smoker" search "smoke"; for "hydration" search "hydrated"; for "self-isolation" search "isolate"; for "analgesics" search "Tylenol" or "pain"). If context supports the node as a valid clinical inference → KEEP. If nothing supports it → REMOVE.
 - Keep diagnosis nodes introduced conditionally ("could be", "if not X") — these are valid differentials
 - MEDICAL_HISTORY: only keep lifestyle facts and past conditions that are clinically relevant. Immunization status is not MEDICAL_HISTORY unless the patient is behind on vaccinations — remove it if the patient is up to date.
@@ -556,6 +556,7 @@ The assessment is the most information-dense turn. Add ONLY nodes that:
 - Clearly appear in the assessment text above
 - Are NOT already covered by an existing node (including paraphrases)
 - Are clinically significant (diagnosis, treatment, procedure, lab result)
+- Do NOT add SYMPTOM nodes from the assessment — symptoms must come from patient speech. The doctor may mention symptoms the patient "might get" or hypothetical future symptoms; these are not confirmed findings and must not be added.
 
 Assign new IDs continuing from the highest existing ID (e.g. if last is N_017, start at N_018).
 
@@ -591,14 +592,14 @@ DIAGNOSIS         | DIAGNOSIS         | CAUSES, INDICATES
 DIAGNOSIS         | LOCATION          | LOCATED_AT
 
 ## KEY RULES:
-- A test ORDERED to exclude a diagnosis → RULES_OUT (not CONFIRMS)
+- A test ORDERED to exclude a diagnosis → RULES_OUT (not CONFIRMS). CONFIRMS is ONLY valid for LAB_RESULT → DIAGNOSIS or LAB_RESULT → SYMPTOM. Never use CONFIRMS for PROCEDURE nodes.
 - INDICATES: only create when the doctor explicitly links a symptom to a specific diagnosis. For alternative/differential diagnoses introduced with "could be" or "if not X", do NOT duplicate INDICATES edges — they share implied symptoms with the primary diagnosis
 - TAKEN_FOR: check BOTH early patient turns (patient-reported medications) AND the assessment turn (doctor-recommended treatments)
 - LOCATED_AT: the clinical entity (SYMPTOM, PROCEDURE, DIAGNOSIS) is always the SOURCE; LOCATION is always the TARGET. Never put a LOCATION as source.
 - If an edge requires a node not in the list: call propose_node(text, type, reason) — Python verifies it exists in the transcript. Only use the returned ID if status is "added"
 
 ## SYSTEMATIC NODE CHECKS (do these before finishing):
-1. PROCEDURE nodes: for each, call search_transcript(procedure_text) — find what condition it was ordered to test/exclude → RULES_OUT or CONFIRMS
+1. PROCEDURE nodes: for each, call search_transcript(procedure_text) — find what condition it was ordered to test/exclude → RULES_OUT or INDICATES
 2. TREATMENT nodes: for each, verify you have a TAKEN_FOR edge. If missing, call search_transcript(treatment_text) → TAKEN_FOR
 3. MEDICAL_HISTORY nodes: for each, call search_transcript(history_text) — check if it CAUSES any DIAGNOSIS node
 4. LOCATION nodes: for each, call search_transcript(location_text) — find which SYMPTOM was being discussed → LOCATED_AT with SYMPTOM as source, LOCATION as target
