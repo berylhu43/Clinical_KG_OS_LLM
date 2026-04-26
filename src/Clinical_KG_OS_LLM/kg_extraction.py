@@ -16,26 +16,12 @@ import re
 import argparse
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from Clinical_KG_OS_LLM.paths import transcripts_dir
 
 # === Tool definitions ===
-CHECK_NODE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "check_node_in_transcript",
-        "description": "Check if a clinical entity text appears in the transcript. Returns match type (exact, stem, partial, none) and an evidence snippet.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "node_id": {"type": "string"},
-                "node_text": {"type": "string", "description": "The node text to search for"}
-            },
-            "required": ["node_id", "node_text"]
-        }
-    }
-}
 
 GET_TURN_TOOL = {
     "type": "function",
@@ -67,38 +53,6 @@ SEARCH_TRANSCRIPT_TOOL = {
     }
 }
 
-CHECK_EDGE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "check_edge_evidence",
-        "description": "Find transcript turns where both source and target entities appear (same turn or adjacent turns). Returns co-occurrence evidence supporting the relationship.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "source_text": {"type": "string"},
-                "target_text": {"type": "string"},
-                "edge_type": {"type": "string", "description": "The proposed edge type"}
-            },
-            "required": ["source_text", "target_text", "edge_type"]
-        }
-    }
-}
-
-VALIDATE_EDGE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "validate_edge_type",
-        "description": "Returns allowed edge types for a source-target node type pair, based on patterns in clinical KGs.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "source_type": {"type": "string", "description": "Node type of source (SYMPTOM, DIAGNOSIS, TREATMENT, PROCEDURE, LOCATION, MEDICAL_HISTORY, LAB_RESULT)"},
-                "target_type": {"type": "string", "description": "Node type of target"}
-            },
-            "required": ["source_type", "target_type"]
-        }
-    }
-}
 
 PROPOSE_NODE_TOOL = {
     "type": "function",
@@ -503,14 +457,13 @@ NODE_EXTRACTION_PROMPT = """You are an experienced clinical physician reviewing 
 
 ## RULES:
 - Extract only what is clinically significant — a doctor would document it
-- Use lowercase, short canonical text matching standard clinical terminology
 - For SYMPTOM nodes: use the patient's own qualifying language when clinically meaningful (e.g. "sharp chest pain" not "chest pain", "persistent dry cough" not "cough"). Only extract symptoms the patient confirmed as present — denied symptoms are not nodes. Do NOT extract vague phrases like "feeling unwell" — use the specific symptom name.
 - For DIAGNOSIS nodes: use the full standard name with qualifiers (e.g. "covid-19" not "covid", "viral illness" not "virus"). Extract ALL diagnoses in the assessment including differentials ("could be X", "if not X")
 - For PROCEDURE nodes: include what is being tested (e.g. "covid swab" not "swab", "nasal swab" not "swab")
-- For TREATMENT nodes: extract the clinical noun or brand name, not the activity phrasing (e.g. "hydration" not "well hydrated", "self-isolation" not "isolate for 14 days", "rest" not "sleeping well"). When a patient or doctor names a specific drug (Tylenol, Advil, Ventolin), keep that exact name — do not abstract to a drug class like "analgesics" or "antipyretics".
+- For TREATMENT nodes: extract the clinical noun, brand name, or the activity phrasing matching transcript wording (e.g. "hydration", "well hydrated", "self-isolation", "isolate for 14 days"). When a patient or doctor names a specific drug (Tylenol, Advil, Ventolin), keep that exact name — do not abstract to a drug class like "analgesics" or "antipyretics".
 - For MEDICAL_HISTORY: extract ALL of the following when mentioned — (a) lifestyle negations from "No" answers ("no" to smoking → "non-smoker"; "healthy, no conditions" → "no chronic conditions"); (b) substance use (alcohol use, marijuana use) when confirmed; (c) exposure or contact history (school exposure, contact with confirmed case); (d) family history (family history of epilepsy, family history of diabetes); (e) past injuries or conditions (broken arm, prior hospitalization); (f) medication adherence events (missed medication dose, forgot to take medication); (g) immunization status whether up to date or not.
 - For LOCATION nodes: single lowercase anatomical term matching transcript wording (e.g. "chest", "left arm", "throat"). One location per node — do not combine multiple body parts.
-- For LAB_RESULT nodes: always include the measured value with units (e.g. "A1C 7.2%", "BP 148/90", "temperature 101°F"). Do not extract a lab name without its value.
+- For LAB_RESULT nodes: always include the measured value with units (e.g. "A1C 7.2%", "BP 148/90", "temperature 101 F"). Do not extract a lab name without its value.
 - The doctor's final assessment turn is information-dense: extract each diagnosis, treatment, procedure, and lab result as a separate node
 
 TRANSCRIPT:
@@ -529,16 +482,16 @@ REVIEW_NODE_PROMPT = """You are a senior clinician verifying extracted clinical 
 Your ONLY job is to decide KEEP or REMOVE for each node. Do NOT rename or normalize node text — canonicalization happens in a separate later pass. Return the same text as given.
 
 For EACH node:
-- FIRST — if the node is MEDICAL_HISTORY with text starting "non-", "no ", "never " (e.g. "non-smoker", "no allergies", "no chronic conditions"): do NOT call check_node_in_transcript. Instead call search_transcript with the base keyword (e.g. "smoke" for "non-smoker", "allerg" for "no allergies") to find the question-answer exchange. If the patient answers "No" or equivalent → KEEP. These are valid clinical inferences.
-- OTHERWISE call check_node_in_transcript to verify textual support. Use these rules:
-  - Match found in patient turn → KEEP
-  - Match found in doctor question turn → check the patient reply in the evidence:
-    - For SYMPTOM nodes: if patient denied it (e.g. "No", "not really") → REMOVE
-    - Otherwise if patient confirmed → KEEP
-  - No match → call search_transcript with a related keyword to find supporting context (e.g. for "hydration" search "hydrated"; for "self-isolation" search "isolate"; for "analgesics" search "Tylenol" or "pain"). If context supports the node as a valid clinical inference → KEEP. If nothing supports it → REMOVE.
-- Keep diagnosis nodes introduced conditionally ("could be", "if not X") — these are valid differentials
-- MEDICAL_HISTORY: keep all social history (smoking, alcohol, substance use), exposure history, family history, past injuries, medication adherence events, and immunization status — do NOT filter based on perceived relevance to the chief complaint.
-- For LAB_RESULT nodes: verify the numeric value is present in the transcript. If the node has no value, call search_transcript to find the measurement. If no value exists in the transcript, remove it.
+1. Call get_turn(turn_id) to read the source turn.
+2. If that turn is a doctor turn (D-X): also call get_turn("P-X") to read the patient's reply at the same number.
+3. Read both turns and decide by node type:
+    - SYMPTOM: KEEP if the patient confirmed it as present; REMOVE if denied ("No", "not really", "I don't think so")
+    - DIAGNOSIS: KEEP if mentioned as active, suspected, or differential ("could be", "rule out", "if not X")
+    - TREATMENT / PROCEDURE: KEEP if ordered, recommended, or reported by patient or doctor
+    - MEDICAL_HISTORY: KEEP if the patient confirmed it — this includes lifestyle (smoking, alcohol), exposure history, family history, past injuries, medication adherence. REMOVE if the patient explicitly denied it.
+    - LOCATION: KEEP if the location appears in a confirmed patient statement or alongside a confirmed symptom. If found only in a doctor's question, check the patient's reply — if the patient denied the associated symptom, REMOVE.
+    - LAB_RESULT: KEEP if a numeric value is present in the turn text; REMOVE if no value found (call search_transcript first to verify)
+4. If get_turn returns no content or the turn is unrelated: call search_transcript with a related keyword to find supporting context. KEEP if found, REMOVE if nothing supports it.
 
 NODES:
 {nodes}
@@ -614,6 +567,62 @@ NODES:
 
 Use the tools to look up evidence, then output ONLY valid JSON:
 {{"edges": [{{"source_id": "N_001", "target_id": "N_002", "type": "INDICATES", "evidence": "...", "turn_id": "D-52"}}]}}"""
+
+
+
+EDGE_EXTRACTION_PROMPT_FULL = """You are an experienced clinical physician extracting relationships between clinical entities from a doctor-patient transcript.
+
+You have the complete transcript and a validated node list with evidence. Use both to reason about relationships — edges often require understanding the full conversation arc, not just adjacent turns.
+
+## VALID EDGE SCHEMA — hard constraints (Source LEFT, Target RIGHT):
+Source type       | Target type       | Allowed edge types
+SYMPTOM           | DIAGNOSIS         | INDICATES, RULES_OUT
+SYMPTOM           | LOCATION          | LOCATED_AT
+SYMPTOM           | MEDICAL_HISTORY   | INDICATES, RULES_OUT
+SYMPTOM           | SYMPTOM           | CAUSES
+TREATMENT         | DIAGNOSIS         | TAKEN_FOR
+TREATMENT         | MEDICAL_HISTORY   | TAKEN_FOR
+TREATMENT         | SYMPTOM           | TAKEN_FOR, CAUSES
+PROCEDURE         | DIAGNOSIS         | RULES_OUT, INDICATES
+PROCEDURE         | LOCATION          | LOCATED_AT
+MEDICAL_HISTORY   | DIAGNOSIS         | CAUSES, INDICATES
+MEDICAL_HISTORY   | MEDICAL_HISTORY   | CAUSES, INDICATES
+MEDICAL_HISTORY   | SYMPTOM           | CAUSES
+MEDICAL_HISTORY   | LOCATION          | LOCATED_AT
+LAB_RESULT        | SYMPTOM           | CONFIRMS
+LAB_RESULT        | DIAGNOSIS         | CONFIRMS
+DIAGNOSIS         | DIAGNOSIS         | CAUSES, INDICATES
+DIAGNOSIS         | LOCATION          | LOCATED_AT
+DIAGNOSIS         | SYMPTOM           | CAUSES
+
+## KEY RULES:
+- INDICATES (SYMPTOM→DIAGNOSIS): only when the doctor explicitly links this specific symptom to a diagnosis. For collective language ("your symptoms overlap with X"), only create INDICATES if the assessment co-mentions this symptom and the diagnosis in the same sentence. Do NOT create INDICATES just because both appear in the transcript.
+- RULES_OUT: a test ORDERED to exclude a diagnosis → RULES_OUT. CONFIRMS is ONLY valid for LAB_RESULT nodes.
+- TAKEN_FOR: check BOTH patient-reported medications (early turns) AND doctor-recommended treatments (assessment turn).
+- CAUSES: requires an explicit causal event or mechanism — e.g. missed medication dose → seizure, school exposure → infection. Do NOT use CAUSES just because two entities co-occur.
+- LOCATED_AT: clinical entity is always SOURCE, LOCATION is always TARGET.
+
+## SYSTEMATIC CHECKS — go through each node type before finishing:
+1. PROCEDURE: what condition was it ordered to test/exclude? → RULES_OUT or INDICATES
+2. TREATMENT: does it have a TAKEN_FOR edge? Check both early patient turns and the assessment.
+3. MEDICAL_HISTORY: does it CAUSE any DIAGNOSIS or SYMPTOM? Look for explicit causal events.
+4. LOCATION: which SYMPTOM was being discussed when this location was mentioned? → LOCATED_AT
+5. SYMPTOM: is there a doctor turn explicitly linking it to a specific diagnosis? → INDICATES
+6. LAB_RESULT: which diagnosis or symptom does the doctor tie the result to? → CONFIRMS
+
+## PROPOSING MISSING NODES:
+If an edge requires a node not in the list, add it to "proposed_nodes" — Python will verify it exists in the transcript before accepting it.
+
+NODES:
+{nodes}
+
+TRANSCRIPT:
+{transcript}
+
+Output ONLY valid JSON:
+{{"edges": [{{"source_id": "N_001", "target_id": "N_002", "type": "INDICATES", "evidence": "<exact quote>", "turn_id": "D-52"}}],
+ "proposed_nodes": [{{"text": "...", "type": "MEDICAL_HISTORY", "evidence": "<exact quote>", "turn_id": "P-9"}}]}}
+Omit "proposed_nodes" if none are needed."""
 
 
 EDGE_REVIEW_PROMPT = """You are a senior clinician reviewing extracted clinical KG edges for clinical plausibility.
@@ -693,40 +702,6 @@ Return ONLY valid JSON:
 {{"nodes": [{{"id": "N_001", "text": "canonical name", "type": "SYMPTOM"}}]}}"""
 
 
-REVIEW_PROMPT = """You are a senior clinical physician doing a final review of an extracted knowledge graph. Compare it against the original transcript and correct any issues.
-
-TRANSCRIPT:
-{transcript}
-
-EXTRACTED KG:
-{kg}
-
-Review checklist:
-1. Missing clinically significant entities — add them
-2. Missing relationships between existing nodes — add them
-3. Incorrect node text — normalize to short canonical clinical terms (lowercase, standard names)
-4. Incorrect node or edge types — remap to the allowed types below
-5. Denied/absent symptoms must use "absent [symptom]" format (e.g. "absent fever", "absent chest pain")
-
-## ALLOWED NODE TYPES (no exceptions):
-- SYMPTOM: Symptoms present or absent. Absent ones: "absent fever", "absent cough"
-- DIAGNOSIS: Conditions active, suspected, or ruled out: "viral infection / common cold", "asthma ruled out"
-- TREATMENT: Medications and interventions. Generic names: "tylenol", "decongestants", "hydration"
-- PROCEDURE: Tests and exams: "covid swab", "chest x-ray", "pulse oximetry"
-- LOCATION: Body parts only, single concise word: "nose", "chest", "throat"
-- MEDICAL_HISTORY: Past conditions, exposures, family history, lifestyle, allergies
-- LAB_RESULT: Lab values with measurements: "temperature ~101 f"
-
-## ALLOWED EDGE TYPES (no exceptions):
-- CAUSES: Risk factor/exposure causes condition
-- INDICATES: Symptom/finding indicates diagnosis
-- LOCATED_AT: Symptom located at body part
-- RULES_OUT: Test/finding/absent symptom rules out diagnosis
-- TAKEN_FOR: Treatment prescribed for condition
-- CONFIRMS: Lab/test confirms diagnosis
-
-Return the complete improved JSON with the same format (nodes + edges). Output ONLY valid JSON."""
-
 
 
 # === Model Client ===
@@ -776,13 +751,13 @@ class OpenRouterClient:
 
         return "", None
 
-    def generate_with_tools(self, prompt: str, tools: list, dispatch: callable) -> tuple:
+    def generate_with_tools(self, prompt: str, tools: list, dispatch: callable, limit: int = 80) -> tuple:
         """Multi-turn generation with tool calling. dispatch(name, args) -> result dict.
 
         Graceful degradation: at WARN_AT iterations inject a stop signal so the model
         wraps up cleanly. Falls back to last partial assistant output if limit is hit.
         """
-        LIMIT = 80
+        LIMIT = limit
         WARN_AT = LIMIT - 5
 
         messages = [{"role": "user", "content": prompt}]
@@ -919,23 +894,23 @@ def get_transcript_files():
     return files
 
 
-def review_nodes_with_tool(nodes: list, transcript: str, client: OpenRouterClient) -> tuple:
+def review_nodes_with_tool(nodes: list, transcript: str, client: OpenRouterClient, index: 'TranscriptIndex' = None) -> tuple:
     """Review extracted nodes using tool-based transcript verification."""
-    idx = TranscriptIndex(transcript)
+    idx = index if index is not None else TranscriptIndex(transcript)
     nodes_json = json.dumps(
-        [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in nodes],
+        [{"id": n["id"], "text": n["text"], "type": n["type"], "turn_id": n.get("turn_id", "")} for n in nodes],
         indent=2
     )
     prompt = REVIEW_NODE_PROMPT.format(nodes=nodes_json)
 
     def dispatch(name, args):
-        if name == "check_node_in_transcript":
-            return check_node_in_transcript(args["node_text"], transcript, index=idx)
+        if name == "get_turn":
+            return get_turn(args["turn_id"], transcript, index=idx)
         if name == "search_transcript":
             return search_transcript(args["keyword"], transcript, index=idx)
         return {"error": f"unknown tool: {name}"}
 
-    content, usage = client.generate_with_tools(prompt, [CHECK_NODE_TOOL, SEARCH_TRANSCRIPT_TOOL], dispatch)
+    content, usage = client.generate_with_tools(prompt, [GET_TURN_TOOL, SEARCH_TRANSCRIPT_TOOL], dispatch, limit=60)
 
     if content:
         result = extract_json_from_response(content)
@@ -952,13 +927,13 @@ def review_nodes_with_tool(nodes: list, transcript: str, client: OpenRouterClien
     return nodes, usage or {}
 
 
-def extract_edges_with_tools(nodes: list, transcript: str, client: OpenRouterClient) -> tuple:
+def extract_edges_with_tools(nodes: list, transcript: str, client: OpenRouterClient, index: 'TranscriptIndex' = None) -> tuple:
     """Extract edges using tool-based transcript lookup. Supports propose_node for mid-pass node discovery.
 
     Returns (edges, proposed_ids, usage) where proposed_ids tracks nodes added via propose_node
     so the caller can run them through review_nodes_with_tool for type/canonicalization correction.
     """
-    idx = TranscriptIndex(transcript)
+    idx = index if index is not None else TranscriptIndex(transcript)
     assessment_turn_id = get_longest_doctor_turn(transcript, index=idx).get("turn_id", "unknown")
 
     def _node_num(n):
@@ -1018,7 +993,6 @@ def extract_edges_with_tools(nodes: list, transcript: str, client: OpenRouterCli
             return result["edges"], proposed_ids, usage or {}
 
     return [], proposed_ids, usage or {}
-
 
 def schema_filter_edges(edges: list, nodes: list) -> tuple:
     """Remove edges whose (source_type, target_type, edge_type) is not in VALID_EDGE_PATTERNS.
@@ -1096,9 +1070,9 @@ def canonicalize_nodes(nodes: list, client: OpenRouterClient) -> tuple:
     return [{**n, "text": canonical_map.get(n["id"], n["text"])} for n in nodes], usage or {}
 
 
-def check_assessment_for_nodes(nodes: list, transcript: str, client: OpenRouterClient) -> tuple:
+def check_assessment_for_nodes(nodes: list, transcript: str, client: OpenRouterClient, index: 'TranscriptIndex' = None) -> tuple:
     """Additive step: inject assessment text and ask LLM to add any missing nodes."""
-    assessment = get_longest_doctor_turn(transcript)
+    assessment = get_longest_doctor_turn(transcript, index=index)
     if not assessment.get("text"):
         return [], {}
 
@@ -1139,47 +1113,6 @@ def check_assessment_for_nodes(nodes: list, transcript: str, client: OpenRouterC
     return new_nodes, usage or {}
 
 
-def restore_dropped_medical_history(dropped_nodes: list, transcript: str) -> list:
-    """Re-add MEDICAL_HISTORY nodes dropped by Pass 2 when transcript evidence exists.
-
-    Handles:
-    - Negative-state nodes ("non-smoker", "no diabetes"): search for base keyword
-    - Substance use nodes ("marijuana use", "alcohol use"): search for substance keyword
-    - Any other MEDICAL_HISTORY: try exact match then first-significant-word search
-    """
-    restored = []
-    for node in dropped_nodes:
-        if node.get("type") != "MEDICAL_HISTORY":
-            continue
-        text = node.get("text", "").lower()
-
-        # Try exact match first
-        result = check_node_in_transcript(text, transcript)
-        if result["matched"]:
-            restored.append(node)
-            continue
-
-        # For negative-state nodes, search for the base keyword
-        keyword = None
-        for prefix in ("non-", "no ", "never ", "absent "):
-            if text.startswith(prefix):
-                keyword = text[len(prefix):].strip()
-                break
-
-        # Fallback: first significant word (handles "marijuana use", "alcohol use", etc.)
-        if keyword is None:
-            words = [w for w in re.findall(r'\b[a-z]{4,}\b', text)
-                     if w not in ("with", "from", "that", "this", "have", "been", "history", "past")]
-            keyword = words[0] if words else None
-
-        if keyword:
-            search_result = search_transcript(keyword, transcript)
-            if search_result["matches"]:
-                restored.append(node)
-
-    return restored
-
-
 def deduplicate_edges(edges: list) -> list:
     """Remove duplicate edges with the same source, target, and type."""
     seen = set()
@@ -1204,6 +1137,91 @@ def extract_naive(transcript: str, client: OpenRouterClient) -> tuple:
         return kg, usage
     return None, usage
 
+def extract_edges_full_context(nodes: list, transcript: str, client: OpenRouterClient, index: 'TranscriptIndex' = None) -> tuple:
+    """Full-context edge extraction: two parallel LLM calls, results merged.
+
+    Returns (edges, added_nodes, usage). added_nodes are proposed nodes that passed
+    Python-side transcript verification via check_node_in_transcript.
+    """
+    idx = index if index is not None else TranscriptIndex(transcript)
+
+    nodes_json = json.dumps(
+        [{"id": n["id"], "text": n["text"], "type": n["type"],
+          "evidence": n.get("evidence", ""), "turn_id": n.get("turn_id", "")}
+         for n in nodes],
+        indent=2
+    )
+    prompt = EDGE_EXTRACTION_PROMPT_FULL.format(nodes=nodes_json, transcript=transcript)
+
+    def _parse(content):
+        if not content:
+            return {"edges": [], "proposed_nodes": []}
+        r = extract_json_from_response(content)
+        if isinstance(r, list):
+            r = {"edges": r}
+        if not r or "edges" not in r:
+            return {"edges": [], "proposed_nodes": []}
+        if "proposed_nodes" not in r:
+            r["proposed_nodes"] = []
+        return r
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(client.generate, prompt)
+        f2 = pool.submit(client.generate, prompt)
+        (content1, usage1), (content2, usage2) = f1.result(), f2.result()
+
+    combined_usage = {
+        "prompt_tokens": (usage1 or {}).get("prompt_tokens", 0) + (usage2 or {}).get("prompt_tokens", 0),
+        "completion_tokens": (usage1 or {}).get("completion_tokens", 0) + (usage2 or {}).get("completion_tokens", 0),
+    }
+
+    res1, res2 = _parse(content1), _parse(content2)
+
+    # Merge proposed_nodes first (dedup on text+type, validate, assign IDs)
+    added_nodes = []
+    existing_keys = {(n["text"].lower().strip(), n.get("type", "")) for n in nodes}
+    try:
+        next_id = max(int(n["id"].split("_")[1]) for n in nodes if "_" in n.get("id", "")) + 1
+    except ValueError:
+        next_id = len(nodes) + 1
+
+    all_proposed = res1.get("proposed_nodes", []) + res2.get("proposed_nodes", [])
+    for pn in all_proposed:
+        text = pn.get("text", "").strip()
+        node_type = pn.get("type", "").upper()
+        if not text or not node_type:
+            continue
+        key = (text.lower(), node_type)
+        if key in existing_keys:
+            continue
+        check = check_node_in_transcript(text, transcript, index=idx)
+        if check["matched"]:
+            new_node = {
+                "id": f"N_{next_id:03d}",
+                "text": text,
+                "type": node_type,
+                "evidence": pn.get("evidence", check.get("evidence") or ""),
+                "turn_id": pn.get("turn_id", ""),
+            }
+            nodes.append(new_node)
+            added_nodes.append(new_node)
+            existing_keys.add(key)
+            next_id += 1
+
+    # Merge edges: union on (source_id, target_id, type), first-occurrence wins
+    seen_edges = {}
+    for edge in res1["edges"] + res2["edges"]:
+        src = edge.get("source_id", "")
+        tgt = edge.get("target_id", "")
+        etype = edge.get("type", "")
+        key = (src, tgt, etype)
+        if key not in seen_edges:
+            seen_edges[key] = edge
+
+    edges = list(seen_edges.values())
+    return edges, added_nodes, combined_usage
+
+
 def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> tuple:
     """Six-pass extraction pipeline:
     node extraction → assessment node check → node review → dedup
@@ -1217,38 +1235,59 @@ def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> 
             total_usage["prompt_tokens"] += u.get("prompt_tokens", 0)
             total_usage["completion_tokens"] += u.get("completion_tokens", 0)
 
-    # Pass 1: node extraction
-    content, usage = client.generate(NODE_EXTRACTION_PROMPT.format(transcript=transcript))
-    add_usage(usage)
-    if not content:
-        print("(pass1: no content)", end=" ", flush=True)
+    # Build transcript index once — reused by all tool-calling passes
+    idx = TranscriptIndex(transcript)
+
+    # Pass 1: two parallel node extraction agents — merged on (text, type) to maximise recall
+    prompt_p1 = NODE_EXTRACTION_PROMPT.format(transcript=transcript)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(client.generate, prompt_p1)
+        f2 = pool.submit(client.generate, prompt_p1)
+        (content1, usage1), (content2, usage2) = f1.result(), f2.result()
+    add_usage(usage1)
+    add_usage(usage2)
+
+    def _parse_nodes(content):
+        if not content:
+            return []
+        r = extract_json_from_response(content)
+        if isinstance(r, list):
+            r = {"nodes": r}
+        return r["nodes"] if r and "nodes" in r else []
+
+    raw1, raw2 = _parse_nodes(content1), _parse_nodes(content2)
+    if not raw1 and not raw2:
+        print("(pass1: both agents returned no content)", end=" ", flush=True)
         return None, total_usage, {}
-    node_result = extract_json_from_response(content)
-    if isinstance(node_result, list):
-        node_result = {"nodes": node_result}
-    if not node_result or "nodes" not in node_result:
-        print(f"(pass1: bad JSON: {content[:80]})", end=" ", flush=True)
-        return None, total_usage, {}
-    nodes = node_result["nodes"]
+
+    # Merge: first-occurrence wins on (text.lower(), type); renumber IDs to avoid conflicts
+    seen_p1: set = set()
+    merged: list = []
+    for n in raw1 + raw2:
+        key = (n.get("text", "").lower().strip(), n.get("type", ""))
+        if key[0] and key[1] and key not in seen_p1:
+            seen_p1.add(key)
+            merged.append(n)
+    nodes = [{**n, "id": f"N_{i:03d}"} for i, n in enumerate(merged, 1)]
+
+    debug["pass1_agent1"] = [{"text": n.get("text"), "type": n.get("type")} for n in raw1]
+    debug["pass1_agent2"] = [{"text": n.get("text"), "type": n.get("type")} for n in raw2]
     debug["pass1_nodes"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in nodes]
 
     # Pass 2: assessment node check — inject assessment text, add missing nodes (additive)
-    added_nodes, usage = check_assessment_for_nodes(nodes, transcript, client)
+    added_nodes, usage = check_assessment_for_nodes(nodes, transcript, client, index=idx)
     add_usage(usage)
     if added_nodes:
         nodes.extend(added_nodes)
     debug["pass2_nodes_added"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in added_nodes]
 
-    # Pass 3: node review — verify/normalize only (no full transcript in prompt)
-    reviewed_nodes, usage = review_nodes_with_tool(nodes, transcript, client)
+    # Pass 3: node review — verify each node via get_turn; limit=60 (bounded by node count)
+    reviewed_nodes, usage = review_nodes_with_tool(nodes, transcript, client, index=idx)
     add_usage(usage)
     reviewed_ids = {n["id"] for n in reviewed_nodes}
+    dropped_nodes = [n for n in nodes if n["id"] not in reviewed_ids]
 
-    debug["pass3_nodes_kept"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in reviewed_nodes]
-    debug["pass3_nodes_dropped"] = [
-        {"id": n["id"], "text": n["text"], "type": n["type"]}
-        for n in nodes if n["id"] not in reviewed_ids
-    ]
+    debug["pass3_nodes_dropped"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in dropped_nodes]
 
     # Dedup nodes with same (text, type) — keeps first occurrence
     seen_node_keys = set()
@@ -1258,29 +1297,25 @@ def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> 
         if key not in seen_node_keys:
             seen_node_keys.add(key)
             deduped.append(n)
+    dedup_removed = [n for n in reviewed_nodes if n["id"] not in {d["id"] for d in deduped}]
     reviewed_nodes = deduped
 
-    # Pass 4: edge extraction — tool-based transcript lookup
-    edges, proposed_ids, usage = extract_edges_with_tools(reviewed_nodes, transcript, client)
-    add_usage(usage)
+    debug["pass3_nodes_kept"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in reviewed_nodes]
+    if dedup_removed:
+        debug["pass3_dedup_removed"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in dedup_removed]
 
-    # Pass 4b: review any nodes proposed mid-pass through the same node review gate
-    # (type correction + existence verification — same logic as Pass 3)
-    if proposed_ids:
-        proposed = [n for n in reviewed_nodes if n["id"] in proposed_ids]
-        reviewed_proposed, usage = review_nodes_with_tool(proposed, transcript, client)
-        add_usage(usage)
-        # Replace proposed nodes with their reviewed versions
-        reviewed_proposed_map = {n["id"]: n for n in reviewed_proposed}
-        reviewed_nodes = [
-            reviewed_proposed_map.get(n["id"], n) if n["id"] in proposed_ids else n
-            for n in reviewed_nodes
-        ]
-
-    # Rebuild node_map after propose_node mutations and Pass 4b corrections
+    # node_map built here — authoritative post-dedup; extended with proposed nodes after Pass 4
     node_map = {n["id"]: n for n in reviewed_nodes}
+
+    # Pass 4: full-context edge extraction — single LLM call with complete transcript + enriched nodes
+    edges, pass4_proposed, usage = extract_edges_full_context(reviewed_nodes, transcript, client, index=idx)
+    add_usage(usage)
+    if pass4_proposed:
+        node_map.update({n["id"]: n for n in pass4_proposed})
+        debug["pass4_proposed_nodes"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in pass4_proposed]
+
     if not edges and len(reviewed_nodes) > 5:
-        print("(warn: pass4 0 edges — possible tool-call limit hit)", end=" ", flush=True)
+        print("(warn: pass4 0 edges)", end=" ", flush=True)
     debug["pass4_edges"] = [
         {
             "source": node_map.get(e.get("source_id"), {}).get("text", e.get("source_id")),
@@ -1360,38 +1395,13 @@ def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> 
     return kg, total_usage, debug
 
 
-def extract_with_reflection(transcript: str, client: OpenRouterClient) -> tuple:
-    """Two-pass extraction with self-critique."""
-    # Pass 1: naive extraction
-    kg, usage1 = extract_naive(transcript, client)
-    if not kg:
-        return None, usage1
-
-    # Pass 2: reflection
-    prompt = REVIEW_PROMPT.format(
-        transcript=transcript,
-        kg=json.dumps(kg, indent=2)
-    )
-    content, usage2 = client.generate(prompt)
-
-    improved_kg = None
-    if content:
-        improved_kg = extract_json_from_response(content)
-        if improved_kg:
-            improved_kg = validate_knowledge_graph(improved_kg)
-
-    # merge usage
-    combined_usage = None
-    if usage1 or usage2:
-        combined_usage = {
-            "prompt_tokens": (usage1 or {}).get("prompt_tokens", 0) + (usage2 or {}).get("prompt_tokens", 0),
-            "completion_tokens": (usage1 or {}).get("completion_tokens", 0) + (usage2 or {}).get("completion_tokens", 0),
-        }
-
-    return improved_kg or kg, combined_usage
-
-
-def process_one(txt_path: Path, client: OpenRouterClient, output_dir: Path, suffix: str, method: str = "reflect") -> tuple:
+def process_one(
+    txt_path: Path,
+    client: OpenRouterClient,
+    output_dir: Path,
+    suffix: str,
+    method: str = "reflect",
+) -> tuple:
     """Process single transcript."""
     res_id = txt_path.stem
     output_file = output_dir / f"{res_id}_{suffix}.json"
@@ -1406,10 +1416,8 @@ def process_one(txt_path: Path, client: OpenRouterClient, output_dir: Path, suff
         debug = {}
         if method == "node_edge":
             kg, usage, debug = extract_with_node_edge_agents(transcript, client)
-        elif method == "naive":
-            kg, usage = extract_naive(transcript, client)
         else:
-            kg, usage = extract_with_reflection(transcript, client)
+            kg, usage = extract_naive(transcript, client)
 
         if not kg:
             print("FAILED")
@@ -1454,7 +1462,7 @@ def main():
                         help="Optional list of patient IDs to process (e.g. RES0198 RES0199). Processes all if omitted.")
     parser.add_argument("--method", type=str, default="node_edge",
                         choices=["naive", "reflect", "node_edge"],
-                        help="Extraction method: naive, reflect (2-pass), node_edge (6-pass, default)")
+                        help="Extraction method: naive, node_edge (6-pass, default)")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
