@@ -309,6 +309,7 @@ VALID_EDGE_PATTERNS = {
     ("LAB_RESULT", "DIAGNOSIS"):     ["CONFIRMS"],
     ("DIAGNOSIS", "DIAGNOSIS"):      ["CAUSES", "INDICATES"],
     ("DIAGNOSIS", "LOCATION"):       ["LOCATED_AT"],
+    ("DIAGNOSIS", "SYMPTOM"):        ["CAUSES"],
 }
 
 
@@ -434,22 +435,23 @@ def check_edge_evidence(source_text: str, target_text: str, edge_type: str, tran
 
 
 def get_longest_doctor_turn(transcript: str, index: 'TranscriptIndex' = None) -> dict:
-    """Return the longest doctor turn — typically the assessment/plan."""
+    """Return the assessment/plan turn — longest of the last 6 doctor turns.
+    The assessment is always near the end but can be up to 6 doctor turns from last
+    (observed max across 20 transcripts: RES0217 D-18, 6th from final D-23)."""
+    N = 6
     if index is not None:
-        best_id, best_text, best_len = None, "", 0
-        for turn_id in index.turn_order:
-            if not turn_id.startswith('D-'):
-                continue
-            text = index.turn_text[turn_id]
-            if len(text) > best_len:
-                best_id, best_text, best_len = turn_id, text, len(text)
-        return {"turn_id": best_id, "text": best_text}
-    best = {"turn_id": None, "text": "", "length": 0}
-    for m in re.finditer(r'\[D-(\d+)\]\s*D:\s*(.+?)(?=\n\n\[|\Z)', transcript, re.DOTALL):
-        text = m.group(2).strip()
-        if len(text) > best["length"]:
-            best = {"turn_id": f"D-{m.group(1)}", "text": text, "length": len(text)}
-    return {"turn_id": best["turn_id"], "text": best["text"]}
+        last_n = [(tid, index.turn_text[tid])
+                  for tid in index.turn_order if tid.startswith('D-')][-N:]
+        if not last_n:
+            return {"turn_id": None, "text": ""}
+        best = max(last_n, key=lambda x: len(x[1]))
+        return {"turn_id": best[0], "text": best[1]}
+    turns = [(f"D-{m.group(1)}", m.group(2).strip())
+             for m in re.finditer(r'\[D-(\d+)\]\s*D:\s*(.+?)(?=\n\n\[|\Z)', transcript, re.DOTALL)]
+    if not turns:
+        return {"turn_id": None, "text": ""}
+    best = max(turns[-N:], key=lambda x: len(x[1]))
+    return {"turn_id": best[0], "text": best[1]}
 
 
 # === Configuration ===
@@ -506,7 +508,7 @@ NODE_EXTRACTION_PROMPT = """You are an experienced clinical physician reviewing 
 - For DIAGNOSIS nodes: use the full standard name with qualifiers (e.g. "covid-19" not "covid", "viral illness" not "virus"). Extract ALL diagnoses in the assessment including differentials ("could be X", "if not X")
 - For PROCEDURE nodes: include what is being tested (e.g. "covid swab" not "swab", "nasal swab" not "swab")
 - For TREATMENT nodes: extract the clinical noun or brand name, not the activity phrasing (e.g. "hydration" not "well hydrated", "self-isolation" not "isolate for 14 days", "rest" not "sleeping well"). When a patient or doctor names a specific drug (Tylenol, Advil, Ventolin), keep that exact name — do not abstract to a drug class like "analgesics" or "antipyretics".
-- For MEDICAL_HISTORY: extract lifestyle facts inferred from negative answers (patient says "no" to smoking → extract "non-smoker"; says "I'm pretty healthy, no conditions" → extract "no chronic conditions"). Extract substance use facts (marijuana use, alcohol use) when confirmed. Do NOT extract immunization status unless a deficiency was noted.
+- For MEDICAL_HISTORY: extract ALL of the following when mentioned — (a) lifestyle negations from "No" answers ("no" to smoking → "non-smoker"; "healthy, no conditions" → "no chronic conditions"); (b) substance use (alcohol use, marijuana use) when confirmed; (c) exposure or contact history (school exposure, contact with confirmed case); (d) family history (family history of epilepsy, family history of diabetes); (e) past injuries or conditions (broken arm, prior hospitalization); (f) medication adherence events (missed medication dose, forgot to take medication); (g) immunization status whether up to date or not.
 - For LOCATION nodes: single lowercase anatomical term matching transcript wording (e.g. "chest", "left arm", "throat"). One location per node — do not combine multiple body parts.
 - For LAB_RESULT nodes: always include the measured value with units (e.g. "A1C 7.2%", "BP 148/90", "temperature 101°F"). Do not extract a lab name without its value.
 - The doctor's final assessment turn is information-dense: extract each diagnosis, treatment, procedure, and lab result as a separate node
@@ -526,15 +528,16 @@ REVIEW_NODE_PROMPT = """You are a senior clinician verifying extracted clinical 
 
 Your ONLY job is to decide KEEP or REMOVE for each node. Do NOT rename or normalize node text — canonicalization happens in a separate later pass. Return the same text as given.
 
-For EACH node, call check_node_in_transcript to verify textual support. Use these rules:
-- Match found in patient turn → KEEP
-- Match found in doctor question turn → check the patient reply in the evidence:
-  - For SYMPTOM nodes: if patient denied it (e.g. "No", "not really") → REMOVE
-  - For MEDICAL_HISTORY nodes with text starting "non-", "no ", "never ": a "No" answer from the patient IS the evidence — KEEP unconditionally (e.g. "No" to smoking → "non-smoker" is valid; "No" to medications → "no medications" is valid)
-  - Otherwise if patient confirmed → KEEP
-- No match → call search_transcript with a related keyword to find supporting context (e.g. for "non-smoker" search "smoke"; for "hydration" search "hydrated"; for "self-isolation" search "isolate"; for "analgesics" search "Tylenol" or "pain"). If context supports the node as a valid clinical inference → KEEP. If nothing supports it → REMOVE.
+For EACH node:
+- FIRST — if the node is MEDICAL_HISTORY with text starting "non-", "no ", "never " (e.g. "non-smoker", "no allergies", "no chronic conditions"): do NOT call check_node_in_transcript. Instead call search_transcript with the base keyword (e.g. "smoke" for "non-smoker", "allerg" for "no allergies") to find the question-answer exchange. If the patient answers "No" or equivalent → KEEP. These are valid clinical inferences.
+- OTHERWISE call check_node_in_transcript to verify textual support. Use these rules:
+  - Match found in patient turn → KEEP
+  - Match found in doctor question turn → check the patient reply in the evidence:
+    - For SYMPTOM nodes: if patient denied it (e.g. "No", "not really") → REMOVE
+    - Otherwise if patient confirmed → KEEP
+  - No match → call search_transcript with a related keyword to find supporting context (e.g. for "hydration" search "hydrated"; for "self-isolation" search "isolate"; for "analgesics" search "Tylenol" or "pain"). If context supports the node as a valid clinical inference → KEEP. If nothing supports it → REMOVE.
 - Keep diagnosis nodes introduced conditionally ("could be", "if not X") — these are valid differentials
-- MEDICAL_HISTORY: only keep lifestyle facts and past conditions that are clinically relevant. Immunization status is not MEDICAL_HISTORY unless the patient is behind on vaccinations — remove it if the patient is up to date.
+- MEDICAL_HISTORY: keep all social history (smoking, alcohol, substance use), exposure history, family history, past injuries, medication adherence events, and immunization status — do NOT filter based on perceived relevance to the chief complaint.
 - For LAB_RESULT nodes: verify the numeric value is present in the transcript. If the node has no value, call search_transcript to find the measurement. If no value exists in the transcript, remove it.
 
 NODES:
@@ -779,7 +782,7 @@ class OpenRouterClient:
         Graceful degradation: at WARN_AT iterations inject a stop signal so the model
         wraps up cleanly. Falls back to last partial assistant output if limit is hit.
         """
-        LIMIT = 60
+        LIMIT = 80
         WARN_AT = LIMIT - 5
 
         messages = [{"role": "user", "content": prompt}]
