@@ -1219,22 +1219,6 @@ def extract_edges_full_context(nodes: list, transcript: str, client: OpenRouterC
         indent=2
     )
 
-    pairs_text = ""
-    for i, p in enumerate(candidate_pairs, 1):
-        src, tgt = p["source"], p["target"]
-        pairs_text += (
-            f'[{i}] {p["pair_id"]}: "{src["text"]}" ({src["type"]}) → "{tgt["text"]}" ({tgt["type"]})\n'
-            f'    Allowed types: {", ".join(p["allowed_types"])}\n'
-            f'    Source evidence: {str(src.get("evidence", ""))[:120]}\n'
-            f'    Target evidence: {str(tgt.get("evidence", ""))[:120]}\n\n'
-        )
-
-    prompt = EDGE_PAIR_CLASSIFICATION_PROMPT.format(
-        nodes=nodes_json,
-        pairs=pairs_text,
-        transcript=transcript,
-    )
-
     def _parse(content):
         if not content:
             return {"edges": [], "proposed_nodes": []}
@@ -1247,17 +1231,38 @@ def extract_edges_full_context(nodes: list, transcript: str, client: OpenRouterC
             r["proposed_nodes"] = []
         return r
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f1 = pool.submit(client.generate, prompt)
-        f2 = pool.submit(client.generate, prompt)
-        (content1, usage1), (content2, usage2) = f1.result(), f2.result()
+    PAIR_BATCH_SIZE = 20
+    combined_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    all_results = []  # alternating agent1/agent2 per batch
 
-    combined_usage = {
-        "prompt_tokens": (usage1 or {}).get("prompt_tokens", 0) + (usage2 or {}).get("prompt_tokens", 0),
-        "completion_tokens": (usage1 or {}).get("completion_tokens", 0) + (usage2 or {}).get("completion_tokens", 0),
-    }
+    for batch_start in range(0, len(candidate_pairs), PAIR_BATCH_SIZE):
+        batch = candidate_pairs[batch_start:batch_start + PAIR_BATCH_SIZE]
 
-    res1, res2 = _parse(content1), _parse(content2)
+        pairs_text = ""
+        for i, p in enumerate(batch, batch_start + 1):
+            src, tgt = p["source"], p["target"]
+            pairs_text += (
+                f'[{i}] {p["pair_id"]}: "{src["text"]}" ({src["type"]}) → "{tgt["text"]}" ({tgt["type"]})\n'
+                f'    Allowed types: {", ".join(p["allowed_types"])}\n'
+                f'    Source evidence: {str(src.get("evidence", ""))[:120]}\n'
+                f'    Target evidence: {str(tgt.get("evidence", ""))[:120]}\n\n'
+            )
+
+        prompt = EDGE_PAIR_CLASSIFICATION_PROMPT.format(
+            nodes=nodes_json,
+            pairs=pairs_text,
+            transcript=transcript,
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(client.generate, prompt)
+            f2 = pool.submit(client.generate, prompt)
+            (content1, usage1), (content2, usage2) = f1.result(), f2.result()
+
+        combined_usage["prompt_tokens"] += (usage1 or {}).get("prompt_tokens", 0) + (usage2 or {}).get("prompt_tokens", 0)
+        combined_usage["completion_tokens"] += (usage1 or {}).get("completion_tokens", 0) + (usage2 or {}).get("completion_tokens", 0)
+        all_results.append(_parse(content1))
+        all_results.append(_parse(content2))
 
     # Merge proposed_nodes first (dedup on text+type, validate, assign IDs)
     added_nodes = []
@@ -1267,7 +1272,7 @@ def extract_edges_full_context(nodes: list, transcript: str, client: OpenRouterC
     except ValueError:
         next_id = len(nodes) + 1
 
-    all_proposed = res1.get("proposed_nodes", []) + res2.get("proposed_nodes", [])
+    all_proposed = [pn for r in all_results for pn in r.get("proposed_nodes", [])]
     for pn in all_proposed:
         text = pn.get("text", "").strip()
         node_type = pn.get("type", "").upper()
@@ -1292,7 +1297,7 @@ def extract_edges_full_context(nodes: list, transcript: str, client: OpenRouterC
 
     # Merge edges: union on (source_id, target_id, type), first-occurrence wins
     seen_edges = {}
-    for edge in res1["edges"] + res2["edges"]:
+    for edge in [e for r in all_results for e in r["edges"]]:
         src = edge.get("source_id", "")
         tgt = edge.get("target_id", "")
         etype = edge.get("type", "")
@@ -1301,8 +1306,9 @@ def extract_edges_full_context(nodes: list, transcript: str, client: OpenRouterC
             seen_edges[key] = edge
 
     edges = list(seen_edges.values())
-    combined_usage["_agent1_edge_count"] = len(res1["edges"])
-    combined_usage["_agent2_edge_count"] = len(res2["edges"])
+    # agent1 = even-indexed results (first agent per batch), agent2 = odd-indexed
+    combined_usage["_agent1_edge_count"] = sum(len(all_results[i]["edges"]) for i in range(0, len(all_results), 2))
+    combined_usage["_agent2_edge_count"] = sum(len(all_results[i]["edges"]) for i in range(1, len(all_results), 2))
     combined_usage["_candidate_pairs"] = len(candidate_pairs)
     return edges, added_nodes, combined_usage
 
