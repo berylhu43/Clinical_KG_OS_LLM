@@ -685,6 +685,56 @@ Output ONLY valid JSON:
 Omit "proposed_nodes" if none are needed."""
 
 
+EDGE_EXTRACTION_BATCH_PROMPT = """You are an experienced clinical physician extracting relationships between clinical entities from a doctor-patient transcript.
+
+You have the complete transcript and a validated node list with evidence. Use both to reason about relationships — edges often require understanding the full conversation arc, not just adjacent turns.
+
+## VALID EDGE SCHEMA — hard constraints (Source LEFT, Target RIGHT):
+Source type       | Target type       | Allowed edge types
+SYMPTOM           | DIAGNOSIS         | INDICATES, RULES_OUT
+SYMPTOM           | LOCATION          | LOCATED_AT
+SYMPTOM           | MEDICAL_HISTORY   | INDICATES, RULES_OUT
+SYMPTOM           | SYMPTOM           | CAUSES
+TREATMENT         | DIAGNOSIS         | TAKEN_FOR
+TREATMENT         | MEDICAL_HISTORY   | TAKEN_FOR
+TREATMENT         | SYMPTOM           | TAKEN_FOR, CAUSES
+PROCEDURE         | DIAGNOSIS         | RULES_OUT, INDICATES
+PROCEDURE         | LOCATION          | LOCATED_AT
+MEDICAL_HISTORY   | DIAGNOSIS         | CAUSES, INDICATES
+MEDICAL_HISTORY   | MEDICAL_HISTORY   | CAUSES, INDICATES
+MEDICAL_HISTORY   | SYMPTOM           | CAUSES
+MEDICAL_HISTORY   | LOCATION          | LOCATED_AT
+LAB_RESULT        | SYMPTOM           | CONFIRMS
+LAB_RESULT        | DIAGNOSIS         | CONFIRMS
+DIAGNOSIS         | DIAGNOSIS         | CAUSES, INDICATES
+DIAGNOSIS         | LOCATION          | LOCATED_AT
+DIAGNOSIS         | SYMPTOM           | CAUSES
+
+## KEY RULES:
+- INDICATES (SYMPTOM→DIAGNOSIS): only when the doctor explicitly links this specific symptom to a diagnosis. For collective language ("your symptoms overlap with X"), only create INDICATES if the assessment co-mentions this symptom and the diagnosis in the same sentence. Do NOT create INDICATES just because both appear in the transcript.
+- RULES_OUT: a test ORDERED to exclude a diagnosis → RULES_OUT. CONFIRMS is ONLY valid for LAB_RESULT nodes.
+- TAKEN_FOR: check BOTH patient-reported medications (early turns) AND doctor-recommended treatments (assessment turn).
+- CAUSES: requires an explicit causal event or mechanism — e.g. missed medication dose → seizure, school exposure → infection. Do NOT use CAUSES just because two entities co-occur.
+- LOCATED_AT: clinical entity is always SOURCE, LOCATION is always TARGET.
+
+## TASK:
+Find all edges where the SOURCE is one of the SOURCE NODES below. Targets can be any node in ALL NODES.
+
+## SOURCE NODES — find edges FROM these:
+{source_nodes}
+
+## ALL NODES — available as edge targets:
+{all_nodes}
+
+TRANSCRIPT:
+{transcript}
+
+Output ONLY valid JSON:
+{{"edges": [{{"source_id": "N_001", "target_id": "N_002", "type": "INDICATES", "evidence": "<exact quote>", "turn_id": "D-52"}}],
+ "proposed_nodes": [{{"text": "...", "type": "MEDICAL_HISTORY", "evidence": "<exact quote>", "turn_id": "P-9"}}]}}
+Omit "proposed_nodes" if none are needed."""
+
+
 EDGE_REVIEW_PROMPT = """You are a senior clinician reviewing extracted clinical KG edges for clinical plausibility.
 
 Edge schema has already been validated in Python. Your ONLY job is to remove edges that are clinically nonsensical — where the relationship makes no medical sense regardless of transcript content.
@@ -1200,21 +1250,16 @@ def extract_naive(transcript: str, client: OpenRouterClient) -> tuple:
     return None, usage
 
 def extract_edges_full_context(nodes: list, transcript: str, client: OpenRouterClient, index: 'TranscriptIndex' = None) -> tuple:
-    """Edge extraction via node-pair enumeration.
+    """Batched free-form edge extraction: nodes split into source batches, two parallel agents per batch.
 
-    Python enumerates all schema-valid (source, target) pairs; two parallel LLM agents
-    classify each pair. Results are merged on (source_id, target_id, type).
-    Returns (edges, added_nodes, usage).
+    Each batch gets the full transcript and all nodes for context, but only finds edges
+    where the source is one of the batch nodes. Keeps response size bounded regardless
+    of total node count. Returns (edges, added_nodes, usage).
     """
     idx = index if index is not None else TranscriptIndex(transcript)
 
-    candidate_pairs = enumerate_candidate_pairs(nodes)
-    if not candidate_pairs:
-        return [], [], {}
-
-    nodes_json = json.dumps(
-        [{"id": n["id"], "text": n["text"], "type": n["type"],
-          "evidence": n.get("evidence", ""), "turn_id": n.get("turn_id", "")}
+    all_nodes_json = json.dumps(
+        [{"id": n["id"], "text": n["text"], "type": n["type"]}
          for n in nodes],
         indent=2
     )
@@ -1231,26 +1276,23 @@ def extract_edges_full_context(nodes: list, transcript: str, client: OpenRouterC
             r["proposed_nodes"] = []
         return r
 
-    PAIR_BATCH_SIZE = 20
+    SOURCE_BATCH_SIZE = 20
     combined_usage = {"prompt_tokens": 0, "completion_tokens": 0}
     all_results = []  # alternating agent1/agent2 per batch
 
-    for batch_start in range(0, len(candidate_pairs), PAIR_BATCH_SIZE):
-        batch = candidate_pairs[batch_start:batch_start + PAIR_BATCH_SIZE]
+    for batch_start in range(0, len(nodes), SOURCE_BATCH_SIZE):
+        batch_nodes = nodes[batch_start:batch_start + SOURCE_BATCH_SIZE]
 
-        pairs_text = ""
-        for i, p in enumerate(batch, batch_start + 1):
-            src, tgt = p["source"], p["target"]
-            pairs_text += (
-                f'[{i}] {p["pair_id"]}: "{src["text"]}" ({src["type"]}) → "{tgt["text"]}" ({tgt["type"]})\n'
-                f'    Allowed types: {", ".join(p["allowed_types"])}\n'
-                f'    Source evidence: {str(src.get("evidence", ""))[:120]}\n'
-                f'    Target evidence: {str(tgt.get("evidence", ""))[:120]}\n\n'
-            )
+        source_nodes_json = json.dumps(
+            [{"id": n["id"], "text": n["text"], "type": n["type"],
+              "evidence": n.get("evidence", ""), "turn_id": n.get("turn_id", "")}
+             for n in batch_nodes],
+            indent=2
+        )
 
-        prompt = EDGE_PAIR_CLASSIFICATION_PROMPT.format(
-            nodes=nodes_json,
-            pairs=pairs_text,
+        prompt = EDGE_EXTRACTION_BATCH_PROMPT.format(
+            source_nodes=source_nodes_json,
+            all_nodes=all_nodes_json,
             transcript=transcript,
         )
 
@@ -1309,7 +1351,7 @@ def extract_edges_full_context(nodes: list, transcript: str, client: OpenRouterC
     # agent1 = even-indexed results (first agent per batch), agent2 = odd-indexed
     combined_usage["_agent1_edge_count"] = sum(len(all_results[i]["edges"]) for i in range(0, len(all_results), 2))
     combined_usage["_agent2_edge_count"] = sum(len(all_results[i]["edges"]) for i in range(1, len(all_results), 2))
-    combined_usage["_candidate_pairs"] = len(candidate_pairs)
+    combined_usage["_source_batches"] = -(-len(nodes) // SOURCE_BATCH_SIZE)  # ceil division
     return edges, added_nodes, combined_usage
 
 
@@ -1422,11 +1464,11 @@ def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> 
     # node_map built here — authoritative post-canon; extended with proposed nodes after Pass 5
     node_map = {n["id"]: n for n in reviewed_nodes}
 
-    # Pass 5: node-pair enumeration edge extraction — two parallel agents on canonical node set
+    # Pass 5: batched free-form edge extraction — two parallel agents per source-node batch
     edges, pass5_proposed, usage = extract_edges_full_context(reviewed_nodes, transcript, client, index=idx)
     debug["pass5_agent1_edges"] = usage.pop("_agent1_edge_count", 0)
     debug["pass5_agent2_edges"] = usage.pop("_agent2_edge_count", 0)
-    debug["pass5_candidate_pairs"] = usage.pop("_candidate_pairs", 0)
+    debug["pass5_source_batches"] = usage.pop("_source_batches", 0)
     add_usage(usage)
     if pass5_proposed:
         node_map.update({n["id"]: n for n in pass5_proposed})
