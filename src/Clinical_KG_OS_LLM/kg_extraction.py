@@ -279,6 +279,26 @@ def validate_edge_type(source_type: str, target_type: str) -> dict:
     }
 
 
+def enumerate_candidate_pairs(nodes: list) -> list:
+    """Return all schema-valid (source, target) node pairs using VALID_EDGE_PATTERNS."""
+    pairs = []
+    for src in nodes:
+        for tgt in nodes:
+            if src["id"] == tgt["id"]:
+                continue
+            src_type = src.get("type", "").upper()
+            tgt_type = tgt.get("type", "").upper()
+            allowed = VALID_EDGE_PATTERNS.get((src_type, tgt_type), [])
+            if allowed:
+                pairs.append({
+                    "pair_id": f"{src['id']}→{tgt['id']}",
+                    "source": src,
+                    "target": tgt,
+                    "allowed_types": allowed,
+                })
+    return pairs
+
+
 def check_edge_evidence(source_text: str, target_text: str, edge_type: str, transcript: str, index: 'TranscriptIndex' = None) -> dict:
     """Find turns where source and target co-occur (same turn or adjacent turns).
 
@@ -570,6 +590,46 @@ Use the tools to look up evidence, then output ONLY valid JSON:
 
 
 
+EDGE_PAIR_CLASSIFICATION_PROMPT = """You are an experienced clinical physician extracting relationships between clinical entities from a doctor-patient transcript.
+
+Python has already enumerated every schema-valid node pair. Your job is to evaluate each candidate pair and return only those where a real clinical relationship exists in the transcript.
+
+## DECISION RULES (apply strictly):
+- INDICATES (SYMPTOM→DIAGNOSIS): doctor explicitly links this specific symptom to this diagnosis — in the assessment or during the exam. Do NOT use just because both appear in the transcript.
+- INDICATES (MEDICAL_HISTORY→DIAGNOSIS): history is stated as a contributing factor or risk for the diagnosis.
+- RULES_OUT: a test or finding was used specifically to exclude this diagnosis.
+- TAKEN_FOR: treatment/procedure was prescribed, recommended, or reported for this condition or symptom. Check BOTH patient-reported medications (early turns) AND doctor recommendations (assessment turn).
+- CAUSES: explicit causal event or mechanism stated — e.g. "missed medication caused the seizure", "school exposure led to infection". NOT just co-occurrence.
+- LOCATED_AT: clinical entity is at this anatomical site — must be stated or clearly implied.
+- CONFIRMS: lab result directly confirms this diagnosis or explains this symptom — must be explicitly linked by the doctor.
+
+## HOW TO EVALUATE:
+For each candidate pair:
+1. Read the source node's evidence turn and the target node's evidence turn.
+2. Check the assessment turn for explicit connections.
+3. If a relationship is supported by transcript text → include in edges with an exact evidence quote.
+4. If no clear support exists → omit the pair entirely.
+
+Only one edge type per pair (the most specific supported one).
+
+## PROPOSING MISSING NODES:
+If you find an edge that needs a node not in the list, add it to "proposed_nodes" — Python will verify it against the transcript.
+
+NODES (with evidence):
+{nodes}
+
+CANDIDATE PAIRS (evaluate each):
+{pairs}
+
+TRANSCRIPT:
+{transcript}
+
+Output ONLY valid JSON:
+{{"edges": [{{"pair_id": "N_001→N_003", "source_id": "N_001", "target_id": "N_003", "type": "INDICATES", "evidence": "<exact quote>", "turn_id": "D-5"}}],
+ "proposed_nodes": [{{"text": "...", "type": "MEDICAL_HISTORY", "evidence": "<quote>", "turn_id": "P-9"}}]}}
+Omit "proposed_nodes" if none needed."""
+
+
 EDGE_EXTRACTION_PROMPT_FULL = """You are an experienced clinical physician extracting relationships between clinical entities from a doctor-patient transcript.
 
 You have the complete transcript and a validated node list with evidence. Use both to reason about relationships — edges often require understanding the full conversation arc, not just adjacent turns.
@@ -723,6 +783,7 @@ class OpenRouterClient:
                 stream = self.client.chat.completions.create(
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
                     stream=True
                 )
 
@@ -776,7 +837,8 @@ class OpenRouterClient:
                     model=self.model,
                     messages=messages,
                     tools=tools,
-                    tool_choice="auto"
+                    tool_choice="auto",
+                    temperature=0.7
                 )
             except Exception as e:
                 print(f"(tool-call error: {e})", end=" ", flush=True)
@@ -1138,12 +1200,17 @@ def extract_naive(transcript: str, client: OpenRouterClient) -> tuple:
     return None, usage
 
 def extract_edges_full_context(nodes: list, transcript: str, client: OpenRouterClient, index: 'TranscriptIndex' = None) -> tuple:
-    """Full-context edge extraction: two parallel LLM calls, results merged.
+    """Edge extraction via node-pair enumeration.
 
-    Returns (edges, added_nodes, usage). added_nodes are proposed nodes that passed
-    Python-side transcript verification via check_node_in_transcript.
+    Python enumerates all schema-valid (source, target) pairs; two parallel LLM agents
+    classify each pair. Results are merged on (source_id, target_id, type).
+    Returns (edges, added_nodes, usage).
     """
     idx = index if index is not None else TranscriptIndex(transcript)
+
+    candidate_pairs = enumerate_candidate_pairs(nodes)
+    if not candidate_pairs:
+        return [], [], {}
 
     nodes_json = json.dumps(
         [{"id": n["id"], "text": n["text"], "type": n["type"],
@@ -1151,7 +1218,22 @@ def extract_edges_full_context(nodes: list, transcript: str, client: OpenRouterC
          for n in nodes],
         indent=2
     )
-    prompt = EDGE_EXTRACTION_PROMPT_FULL.format(nodes=nodes_json, transcript=transcript)
+
+    pairs_text = ""
+    for i, p in enumerate(candidate_pairs, 1):
+        src, tgt = p["source"], p["target"]
+        pairs_text += (
+            f'[{i}] {p["pair_id"]}: "{src["text"]}" ({src["type"]}) → "{tgt["text"]}" ({tgt["type"]})\n'
+            f'    Allowed types: {", ".join(p["allowed_types"])}\n'
+            f'    Source evidence: {str(src.get("evidence", ""))[:120]}\n'
+            f'    Target evidence: {str(tgt.get("evidence", ""))[:120]}\n\n'
+        )
+
+    prompt = EDGE_PAIR_CLASSIFICATION_PROMPT.format(
+        nodes=nodes_json,
+        pairs=pairs_text,
+        transcript=transcript,
+    )
 
     def _parse(content):
         if not content:
@@ -1219,6 +1301,9 @@ def extract_edges_full_context(nodes: list, transcript: str, client: OpenRouterC
             seen_edges[key] = edge
 
     edges = list(seen_edges.values())
+    combined_usage["_agent1_edge_count"] = len(res1["edges"])
+    combined_usage["_agent2_edge_count"] = len(res2["edges"])
+    combined_usage["_candidate_pairs"] = len(candidate_pairs)
     return edges, added_nodes, combined_usage
 
 
@@ -1304,19 +1389,46 @@ def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> 
     if dedup_removed:
         debug["pass3_dedup_removed"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in dedup_removed]
 
-    # node_map built here — authoritative post-dedup; extended with proposed nodes after Pass 4
+    # Pass 4: canonicalize node text to standard clinical form — before edge extraction to reduce pair count
+    pre_canon_map = {n["id"]: n["text"] for n in reviewed_nodes}
+    reviewed_nodes, usage = canonicalize_nodes(reviewed_nodes, client)
+    add_usage(usage)
+    debug["pass4_nodes_canonical"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in reviewed_nodes]
+    debug["pass4_renames"] = [
+        {"id": n["id"], "before": pre_canon_map[n["id"]], "after": n["text"], "type": n["type"]}
+        for n in reviewed_nodes
+        if pre_canon_map.get(n["id"]) != n["text"]
+    ]
+
+    # Post-canonical dedup — merges nodes with same (text, type) after normalization
+    seen_node_keys = set()
+    deduped_canon = []
+    for n in reviewed_nodes:
+        key = (n["text"].lower().strip(), n.get("type", ""))
+        if key not in seen_node_keys:
+            seen_node_keys.add(key)
+            deduped_canon.append(n)
+    if len(deduped_canon) < len(reviewed_nodes):
+        canon_dedup_removed = [n for n in reviewed_nodes if n["id"] not in {d["id"] for d in deduped_canon}]
+        debug["pass4_canon_dedup_removed"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in canon_dedup_removed]
+    reviewed_nodes = deduped_canon
+
+    # node_map built here — authoritative post-canon; extended with proposed nodes after Pass 5
     node_map = {n["id"]: n for n in reviewed_nodes}
 
-    # Pass 4: full-context edge extraction — single LLM call with complete transcript + enriched nodes
-    edges, pass4_proposed, usage = extract_edges_full_context(reviewed_nodes, transcript, client, index=idx)
+    # Pass 5: node-pair enumeration edge extraction — two parallel agents on canonical node set
+    edges, pass5_proposed, usage = extract_edges_full_context(reviewed_nodes, transcript, client, index=idx)
+    debug["pass5_agent1_edges"] = usage.pop("_agent1_edge_count", 0)
+    debug["pass5_agent2_edges"] = usage.pop("_agent2_edge_count", 0)
+    debug["pass5_candidate_pairs"] = usage.pop("_candidate_pairs", 0)
     add_usage(usage)
-    if pass4_proposed:
-        node_map.update({n["id"]: n for n in pass4_proposed})
-        debug["pass4_proposed_nodes"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in pass4_proposed]
+    if pass5_proposed:
+        node_map.update({n["id"]: n for n in pass5_proposed})
+        debug["pass5_proposed_nodes"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in pass5_proposed]
 
     if not edges and len(reviewed_nodes) > 5:
-        print("(warn: pass4 0 edges)", end=" ", flush=True)
-    debug["pass4_edges"] = [
+        print("(warn: pass5 0 edges)", end=" ", flush=True)
+    debug["pass5_edges"] = [
         {
             "source": node_map.get(e.get("source_id"), {}).get("text", e.get("source_id")),
             "target": node_map.get(e.get("target_id"), {}).get("text", e.get("target_id")),
@@ -1361,33 +1473,6 @@ def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> 
     ]
 
     reviewed_edges = deduplicate_edges(reviewed_edges)
-
-    # Pass 6: canonicalize node text to standard clinical form
-    pre_canon_map = {n["id"]: n["text"] for n in reviewed_nodes}
-    reviewed_nodes, usage = canonicalize_nodes(reviewed_nodes, client)
-    add_usage(usage)
-    debug["pass6_nodes_canonical"] = [{"id": n["id"], "text": n["text"], "type": n["type"]} for n in reviewed_nodes]
-    debug["pass6_renames"] = [
-        {"id": n["id"], "before": pre_canon_map[n["id"]], "after": n["text"], "type": n["type"]}
-        for n in reviewed_nodes
-        if pre_canon_map.get(n["id"]) != n["text"]
-    ]
-
-    # Post-canonical dedup — catches text collisions created by normalization (e.g. flu+influenza → influenza+influenza)
-    seen_node_keys = set()
-    deduped_canon = []
-    for n in reviewed_nodes:
-        key = (n["text"].lower().strip(), n.get("type", ""))
-        if key not in seen_node_keys:
-            seen_node_keys.add(key)
-            deduped_canon.append(n)
-    if len(deduped_canon) < len(reviewed_nodes):
-        surviving_ids = {n["id"] for n in deduped_canon}
-        reviewed_edges = [
-            e for e in reviewed_edges
-            if e.get("source_id") in surviving_ids and e.get("target_id") in surviving_ids
-        ]
-    reviewed_nodes = deduped_canon
 
     kg = {"nodes": reviewed_nodes, "edges": reviewed_edges}
     kg = validate_knowledge_graph(kg)
@@ -1440,13 +1525,14 @@ def process_one(
         p2a = len(debug.get("pass2_nodes_added", []))
         p3k = len(debug.get("pass3_nodes_kept", []))
         p3d = len(debug.get("pass3_nodes_dropped", []))
-        p4 = len(debug.get("pass4_edges", []))
+        p4k = len(debug.get("pass4_nodes_canonical", []))
+        p5 = len(debug.get("pass5_edges", []))
         p5a_d = len(debug.get("pass5a_schema_dropped", []))
         p5k = len(debug.get("pass5b_edges_kept", []))
         p5d = len(debug.get("pass5b_edges_dropped", []))
         assess_n = f" +{p2a}@assess" if p2a else ""
         schema_drop = f" schema-{p5a_d}" if p5a_d else ""
-        print(f"({n}n/{e}e) | nodes: {p1}{assess_n}→{p3k} (-{p3d}) | edges: {p4}{schema_drop}→{p5k} (-{p5d})")
+        print(f"({n}n/{e}e) | nodes: {p1}{assess_n}→{p3k} (-{p3d})→canon{p4k} | edges: {p5}{schema_drop}→{p5k} (-{p5d})")
         return res_id, "OK", n, e, usage
 
     except Exception as ex:
