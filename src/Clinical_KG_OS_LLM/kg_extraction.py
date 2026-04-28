@@ -1497,11 +1497,23 @@ def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> 
         for e in schema_dropped
     ]
 
-    # Pass 5b: clinical plausibility review (no tools — schema already validated)
-    reviewed_edges, usage = review_edges(reviewed_nodes, schema_valid_edges, client)
+    # Pass 5b: drop edges with no transcript evidence — catches pure medical-knowledge inference
+    evidence_filtered = [e for e in schema_valid_edges if e.get("evidence", "").strip()]
+    evidence_dropped = [e for e in schema_valid_edges if not e.get("evidence", "").strip()]
+    debug["pass5b_evidence_dropped"] = [
+        {
+            "source": node_map.get(e.get("source_id"), {}).get("text", e.get("source_id")),
+            "target": node_map.get(e.get("target_id"), {}).get("text", e.get("target_id")),
+            "type": e.get("type"),
+        }
+        for e in evidence_dropped
+    ]
+
+    # Pass 5c: clinical plausibility review (no tools — schema already validated)
+    reviewed_edges, usage = review_edges(reviewed_nodes, evidence_filtered, client)
     add_usage(usage)
     kept_edge_keys = {(e.get("source_id"), e.get("target_id"), e.get("type")) for e in reviewed_edges}
-    debug["pass5b_edges_kept"] = [
+    debug["pass5c_edges_kept"] = [
         {
             "source": node_map.get(e.get("source_id"), {}).get("text", e.get("source_id")),
             "target": node_map.get(e.get("target_id"), {}).get("text", e.get("target_id")),
@@ -1509,14 +1521,14 @@ def extract_with_node_edge_agents(transcript: str, client: OpenRouterClient) -> 
         }
         for e in reviewed_edges
     ]
-    debug["pass5b_edges_dropped"] = [
+    debug["pass5c_edges_dropped"] = [
         {
             "source": node_map.get(e.get("source_id"), {}).get("text", e.get("source_id")),
             "target": node_map.get(e.get("target_id"), {}).get("text", e.get("target_id")),
             "type": e.get("type"),
             "evidence": e.get("evidence", "")[:80],
         }
-        for e in schema_valid_edges
+        for e in evidence_filtered
         if (e.get("source_id"), e.get("target_id"), e.get("type")) not in kept_edge_keys
     ]
 
@@ -1576,11 +1588,13 @@ def process_one(
         p4k = len(debug.get("pass4_nodes_canonical", []))
         p5 = len(debug.get("pass5_edges", []))
         p5a_d = len(debug.get("pass5a_schema_dropped", []))
-        p5k = len(debug.get("pass5b_edges_kept", []))
-        p5d = len(debug.get("pass5b_edges_dropped", []))
+        p5b_d = len(debug.get("pass5b_evidence_dropped", []))
+        p5k = len(debug.get("pass5c_edges_kept", []))
+        p5d = len(debug.get("pass5c_edges_dropped", []))
         assess_n = f" +{p2a}@assess" if p2a else ""
         schema_drop = f" schema-{p5a_d}" if p5a_d else ""
-        print(f"({n}n/{e}e) | nodes: {p1}{assess_n}→{p3k} (-{p3d})→canon{p4k} | edges: {p5}{schema_drop}→{p5k} (-{p5d})")
+        noev_drop = f" noev-{p5b_d}" if p5b_d else ""
+        print(f"({n}n/{e}e) | nodes: {p1}{assess_n}→{p3k} (-{p3d})→canon{p4k} | edges: {p5}{schema_drop}{noev_drop}→{p5k} (-{p5d})")
         return res_id, "OK", n, e, usage
 
     except Exception as ex:
