@@ -1,70 +1,77 @@
 # Clinical GraphRAG Evaluation
 
-## Context
+Extract structured Knowledge Graphs from clinical transcripts and evaluate them against a human-curated reference. Built for the Chicago AI Science hackathon.
 
-Evaluate Knowledge Graph extraction methods for clinical transcripts.
+## Background
 
-**The clinical scenario:**
+A doctor has a 15-minute appointment with a patient. That conversation is recorded and transcribed. The transcript is dense and unstructured — symptoms scattered throughout, past history referenced mid-conversation, treatments discussed in passing. If another clinician needs to quickly understand that patient's situation later (a specialist, an ER doctor, a nurse during handoff), reading the full transcript is slow and error-prone.
 
-A doctor has a 15-minute appointment with a patient. That conversation gets recorded and transcribed. The transcript is dense and unstructured — the patient mentions symptoms scattered throughout, the doctor references past history, treatments get discussed mid-conversation. If another clinician needs to quickly understand that patient's situation later (a specialist, an ER doctor, a nurse doing a handoff), reading the full transcript is slow and error-prone.
+A Knowledge Graph pulls out the structured facts — *this patient has COPD, reported shortness of breath, is on albuterol, has a history of smoking* — and the relationships between them. That's what a doctor mentally does when reading a chart: building a model of entities and how they connect. The richer and more accurate the KG, the better a downstream GraphRAG system can answer questions about the patient.
 
-**What the KG does:**
-
-The extraction step pulls out the structured facts — this patient has COPD, reported shortness of breath, is on albuterol, has a history of smoking — and the relationships between them. That's what a doctor mentally does when they read a chart: they're building a mental model of entities and how they connect.
-
-**Why it matters clinically:**
-
-- Reduces documentation burden — the KG could auto-populate a structured patient summary
-- Enables faster handoffs between care providers
-- Supports clinical decision support — e.g. flagging drug interactions or missing follow-ups
+**Clinically, this matters because it:**
+- Reduces documentation burden — the KG can auto-populate a structured patient summary
+- Enables faster care handoffs
+- Supports clinical decision support (flagging drug interactions, missing follow-ups)
 - Scales across large patient populations for retrospective analysis
 
 ## Hackathon Goal
 
-**Build a multi-agent KG extraction pipeline that produces a Knowledge Graph as close as possible to the human-curated reference KG — at the lowest API cost.**
+**Build a multi-agent KG extraction pipeline that produces a Knowledge Graph as close as possible to the human-curated reference — at the lowest API cost.**
 
-We provide a naive single-pass implementation in `kg_extraction.py` (composite score: **0.562**). Your task is to design better agentic orchestration architectures that extract higher-quality KGs from clinical transcripts. The naive implementation is a starting point and there is significant room for improvement.
+A naive single-pass baseline is provided in `kg_extraction.py` (composite score: **0.562**). Your task is to design better agentic orchestration that extracts higher-quality KGs from clinical transcripts.
 
 ### What is a Knowledge Graph here?
 
-A KG captures **entities** (symptoms, diagnoses, treatments, procedures, etc.) and their **relationships** extracted from patient transcripts. This structured representation is used by **GraphRAG** to retrieve relevant clinical context when answering questions about a patient — the richer and more accurate your KG, the better the QA answers. This simulates how a clinician might query the transcript data.
+A KG captures **entities** (symptoms, diagnoses, treatments, procedures, etc.) and their **relationships** extracted from patient transcripts.
 
-### How is it evaluated?
+Node types:
 
-There are two scoring methods — one you run yourself during development, and one run by organizers at submission.
+| Type | Examples |
+|------|---------|
+| `SYMPTOM` | shortness of breath, dry cough, chest tightness |
+| `DIAGNOSIS` | COPD exacerbation, covid-19, upper respiratory infection |
+| `TREATMENT` | albuterol, tylenol, 14-day isolation |
+| `PROCEDURE` | covid swab, chest x-ray, lung auscultation |
+| `LOCATION` | chest, throat, lungs |
+| `MEDICAL_HISTORY` | smoking, hypertension, type 1 diabetes |
+| `LAB_RESULT` | temperature 101 F, BP 148/90, A1C 7.2% |
 
-#### Your development metric: Composite Score
+Edge types: `INDICATES`, `RULES_OUT`, `CAUSES`, `LOCATED_AT`, `TAKEN_FOR`, `CONFIRMS`
 
-Run `kg_similarity_scorer.py` (Step 4 in Quick Start) at any time to get your **composite score** — a weighted combination of four metrics measuring how close your KG is to the human-curated reference:
+This structured representation is used by **GraphRAG** to retrieve relevant clinical context when answering questions about a patient.
+
+### Scoring
+
+#### Development metric: Composite Score
+
+Run `kg_similarity_scorer.py` at any time to measure how close your KG is to the human-curated reference:
 
 | Component | Weight | Description |
 |-----------|--------|-------------|
-| Entity F1 | 25% | Semantic node overlap with human-curated KG |
+| Entity F1 | 25% | Semantic node overlap with curated KG |
 | Population Completeness | 25% | Node count coverage |
 | Relation Completeness | 25% | Edge count coverage |
 | Schema Completeness | 25% | Node type coverage |
 
-**Higher composite score = your KG is closer to what a human expert would extract.** This is your primary feedback loop during development.
-
 | Method | Composite Score |
 |--------|-----------------|
-| Naive implementation | 0.562 |
+| Naive single-pass (GLM) | 0.562 |
+
+Higher = closer to what a human expert would extract.
 
 #### Final evaluation: LLM Judge (run by organizers)
 
-After submission, organizers run a **GraphRAG QA test** on your KG: clinical questions are answered using your KG via `graphrag_qa_pipeline.py`, and those answers are scored 0–5 by multiple commercial LLMs (GPT, Claude, Gemini, Grok) using a fixed rubric. The averaged score is the final QA score.
+After submission, organizers run a **GraphRAG QA test**: clinical questions are answered using your KG, and those answers are scored 0–5 by multiple commercial LLMs (GPT, Claude, Gemini, Grok). The QA score **correlates linearly with composite score (r = 0.94)**, so optimizing composite score during development is a reliable proxy for final performance.
 
-This QA score has been validated to **linearly correlate (r = 0.94)** with the composite score so optimizing your composite score during development is a reliable proxy for final performance.
-
-**You do not need to run the GraphRAG QA pipeline yourself.** Just submit your KG; organizers handle the rest. The organizers will run the GraphRAG QA and LLM-As-A-Judge scripts as the judge step costs ~$8–10 per run.
+**You do not need to run the GraphRAG QA pipeline yourself.** Organizers handle it — it costs ~$8–10 per run.
 
 ### Model Restriction
 
-To ensure fair comparison and enable future **local deployment**, KG extraction may use **these OpenRouter models**:
+To ensure fair comparison and enable future **local deployment**, KG extraction may use only these OpenRouter models:
 
 | Model | Notes |
 |-------|-------|
-| `z-ai/glm-4.7-flash` | Naive implementation model |
+| `z-ai/glm-4.7-flash` | Naive implementation default |
 | `qwen/qwen3-14b` | |
 | `nvidia/nemotron-3-nano-30b-a3b` | |
 | `openai/gpt-oss-20b` | |
@@ -72,126 +79,143 @@ To ensure fair comparison and enable future **local deployment**, KG extraction 
 
 See `kg_extraction.py` for API usage reference.
 
-### Possible Architecture Directions
-
-![Multi Agent Architectures](figures/multi-agent-architectures.png)
-
 ## Quick Start
 
 ```bash
-# Clone the repository
+# Clone
 git clone https://github.com/chicago-aiscience/Clinical_KG_OS_LLM.git
 cd Clinical_KG_OS_LLM
 
-# Step 0: Install uv and dependencies
-# Install uv: https://docs.astral.sh/uv/getting-started/installation/
+# Install uv, then sync dependencies
+# https://docs.astral.sh/uv/getting-started/installation/
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Sync project dependencies (from project root)
 uv sync
 
-# Step 1: Setup API keys
+# Step 1: API keys
 cp api_keys_example.json api_keys.json
-# Edit api_keys.json and replace "sk-or-v1-your-openrouter-api-key-here" with your key from https://openrouter.ai/keys
+# Edit api_keys.json: replace the placeholder with your key from https://openrouter.ai/keys
 
-# Step 2: KG Extraction (replace this with YOUR method — see kg_extraction.py for the naive implementation)
-# Note: processing all 20 transcripts takes several minutes.
-# For quick iteration during development, test on a small subset:
-#   uv run python -m Clinical_KG_OS_LLM.kg_extraction --output ./my_kg --res-ids RES0198 RES0199
+# Step 2: KG extraction (runs the 6-pass multi-agent pipeline)
+# Tip: test on a small subset first to iterate quickly
+uv run python -m Clinical_KG_OS_LLM.kg_extraction --output ./my_kg --res-ids RES0198 RES0199
+# Full run (all 20 transcripts, takes several minutes):
 uv run python -m Clinical_KG_OS_LLM.kg_extraction --output ./my_kg
 
-# Step 3: Entity Resolution - merge per-patient KGs into unified graph
-uv run python -m Clinical_KG_OS_LLM.dump_graph --input ./my_kg --output ./my_kg_naive
+# Step 3: Entity resolution — merge per-patient KGs into a unified graph
+uv run python -m Clinical_KG_OS_LLM.dump_graph --input ./my_kg --output ./my_kg_unified
 
-# Step 4: Composite score - your primary progress metric
+# Step 4: Score your KG against the human-curated reference
 uv run python -m Clinical_KG_OS_LLM.kg_similarity_scorer \
-  --student ./my_kg_naive/unified_graph_my_kg.json \
+  --student ./my_kg_unified/unified_graph_my_kg.json \
   --baseline ./data/human_curated/unified_graph_curated.json
 
-# Step 5: Visualize the knowledge graph (optional)
+# Step 5: Visualize (optional)
 uv run python -m Clinical_KG_OS_LLM.visualize_kg \
-  --kg ./my_kg_naive/unified_graph_my_kg.json \
-  --output ./my_kg_naive/kg_graph.png
+  --kg ./my_kg_unified/unified_graph_my_kg.json \
+  --output ./my_kg_unified/kg_graph.png
 ```
 
-**Optional:**
+> **Path note:** `dump_graph` writes `unified_graph_{input_dir_name}.json` — e.g. `unified_graph_my_kg.json` when `--input ./my_kg`.
 
-To see how your KG answers clinical questions (as organizers will evaluate it), you can run the GraphRAG QA pipeline:
+**Optional — run GraphRAG QA locally:**
 
 ```bash
 uv run python -m Clinical_KG_OS_LLM.graphrag_qa_pipeline \
-  --kg ./my_kg_naive/unified_graph_my_kg.json
-# Results written to ./my_kg_naive/results_unified_graph_my_kg/
+  --kg ./my_kg_unified/unified_graph_my_kg.json
+# Results written to ./my_kg_unified/results_unified_graph_my_kg/
 ```
 
-You may use the knowledge graph visualization at your discretion during the development process (recommended) but you need to ensure the outputs of your pipeline are formatted in such a way that the judges are able to evaluate after submission.
+### Notebook
 
-**Path note:** `dump_graph` writes `unified_graph_{input_dir_name}.json` (e.g. `unified_graph_my_kg.json` when `--input ./my_kg`)
+Prefer a notebook? `notebooks/quickstart.ipynb` covers Steps 1–5 interactively.
 
-### Quick Start Notebook
-
-Prefer running in a notebook? Use `notebooks/quickstart.ipynb` to run Steps 0–5 interactively. Install Jupyter Lab first with `uv sync --extra jupyter`, then run `jupyter lab` to open the notebook.
+```bash
+uv sync --extra jupyter
+jupyter lab
+```
 
 ## Pipeline Overview
 
 ![Pipeline](figures/pipeline_overview.png)
 
-### Stage 1: KG Construction (Your Focus)
+### Stage 1: KG Construction
 
-| Step | Script | Purpose |
-|------|--------|---------|
-| **KG Extraction** | `kg_extraction.py` | Extract entities (symptoms, diagnoses, treatments) and relations from each patient's transcript. This is the naive implementation — **replace this with your multi-agent pipeline.** |
-| **Entity Resolution** | `dump_graph.py` | Merge per-patient KGs into a unified graph. Uses [BGE-M3](https://arxiv.org/abs/2402.03216) embeddings (0.85 cosine threshold) to deduplicate entities like "high blood pressure" = "hypertension". |
+#### KG Extraction (`kg_extraction.py`)
+
+The provided implementation runs a **6-pass multi-agent pipeline** per transcript:
+
+| Pass | What happens |
+|------|-------------|
+| **1** | Two parallel node extraction agents; results merged on `(text, type)` to maximize recall |
+| **2** | Assessment check — the doctor's final turn is information-dense; a separate agent adds any missed entities |
+| **3** | Node review — tool-calling agent reads each node's source turn via `get_turn` / `search_transcript`, drops denied or unsupported nodes |
+| **4** | Canonicalization — node text normalized to standard clinical form (e.g. `"liquid stools"` → `"diarrhea"`) |
+| **5** | Batched edge extraction — two parallel agents per batch of source nodes; edges require explicit transcript evidence |
+| **5a–5c** | Python schema filter → evidence filter → LLM clinical plausibility review |
+
+The `--method` flag selects the extraction strategy:
+- `node_edge` (default): the 6-pass pipeline above
+- `naive`: single-pass, no verification
+
+#### Entity Resolution (`dump_graph.py`)
+
+Merges 20 per-patient KGs into a single unified graph:
+- Embeds all node texts with [BGE-M3](https://arxiv.org/abs/2402.03216)
+- Clusters by cosine similarity (threshold: **0.85**) within each node type
+- Deduplicates: `"high blood pressure"` = `"hypertension"` → one canonical node
 
 ### Stage 2: Evaluation
 
-| Step | Script | Purpose |
-|------|--------|---------|
-| **GraphRAG QA** | `graphrag_qa_pipeline.py` | Retrieve relevant KG triples for a clinical question and generate an answer. Tests whether your KG captures the right information. Provided at `src/Clinical_KG_OS_LLM/graphrag_qa_pipeline.py`. |
-| **LLM Judge** | `llm_judge_batch_parallel.py` | Multiple commercial LLMs score each answer (0–5) on correctness, completeness, faithfulness, and relevance. Based on [LLM-as-Judge](https://arxiv.org/abs/2306.05685) methodology. **Run by organizers only and not provided.** |
+| Script | Purpose |
+|--------|---------|
+| `graphrag_qa_pipeline.py` | Retrieves relevant KG triples for a clinical question and generates an answer |
+| `kg_similarity_scorer.py` | Computes composite score against the human-curated reference KG |
+| `llm_judge_batch_parallel.py` | Multi-LLM answer scoring — **run by organizers only, not provided** |
 
 ## Expected Output
 
-Participants submit a single JSON file: A unified knowledge graph (`unified_graph_{your_name}.json`) which is produced by running your multi-agent KG extraction pipeline over the 20 provided patient transcripts, followed by entity resolution via `dump_graph.py`.
+Submit a single JSON file: `unified_graph_{your_name}.json` — a unified, deduplicated knowledge graph produced by running your extraction pipeline over the 20 transcripts and then `dump_graph.py`.
 
-The graph captures clinical entities (symptoms, diagnoses, treatments, procedures, etc.) and the relationships between them across all patients in a unified, deduplicated structure. This is the artifact organizers will use for final evaluation.
-
-To generate it:
-
-1. Run your KG extraction pipeline (replacing or extending `kg_extraction.py`) → produces per-patient KG files
-2. Run `dump_graph.py` to merge and deduplicate into the unified graph
-3. Optionally verify your composite score with `kg_similarity_scorer.py` before submitting
-4. Organizers then run the GraphRAG QA pipeline and LLM judge on your submitted graph, you don't need to run that step yourself.
+Steps:
+1. Run your KG extraction pipeline → per-patient JSON files
+2. Run `dump_graph.py` → unified graph
+3. Optionally verify composite score with `kg_similarity_scorer.py`
+4. Organizers run GraphRAG QA + LLM judge on your submission
 
 ## Project Structure
 
 ```
 ├── data/
-│   ├── transcripts/               # 20 patient transcripts × 7 question types (140 QA pairs)
+│   ├── transcripts/               # 20 patient transcripts (+ .mp3 audio)
 │   ├── human_curated/             # Human-curated reference KG (evaluation target)
-│   └── naive_results/             # Pre-computed naive implementation results
+│   └── naive_results/             # Pre-computed naive baseline results
 ├── src/Clinical_KG_OS_LLM/
-│   ├── kg_extraction.py           # Naive single-pass implementation (OpenRouter GLM) — use as reference
-│   ├── dump_graph.py              # Entity resolution & KG merging
+│   ├── kg_extraction.py           # 6-pass multi-agent pipeline (reference implementation)
+│   ├── dump_graph.py              # Entity resolution & KG merging (BGE-M3)
 │   ├── graphrag_qa_pipeline.py    # GraphRAG QA pipeline
-│   └── kg_similarity_scorer.py    # Composite score against human-curated KG
-├── notebooks/quickstart.ipynb     # Interactive tutorial
-├── figures/                       # Visualizations
+│   ├── kg_similarity_scorer.py    # Composite score against reference KG
+│   └── visualize_kg.py            # KG visualization
+├── notebooks/quickstart.ipynb     # Interactive walkthrough
+├── figures/                       # Architecture and pipeline diagrams
 └── pyproject.toml                 # Dependencies (use `uv sync`)
 ```
 
+## Architecture Directions
+
+![Multi-Agent Architectures](figures/multi-agent-architectures.png)
+
 ## Additional Challenge: Speech-to-Text
 
-Each patient folder includes the original `.mp3` audio recording. While we provide pre-generated transcripts, teams can optionally experiment with ASR. We hope to see teams that can provide **high-quality, low-cost solutions** that go directly from `.mp3` audio to Knowledge Graph.
+Each patient folder includes the original `.mp3` recording. Pre-generated transcripts are provided, but teams can optionally build a pipeline that goes directly from `.mp3` to Knowledge Graph.
 
-**Open-source SOTA**: [OpenAI Whisper](https://github.com/openai/whisper) ([Radford et al. 2022](https://arxiv.org/abs/2212.04356))
+**Open-source SOTA:** [OpenAI Whisper](https://github.com/openai/whisper) ([Radford et al. 2022](https://arxiv.org/abs/2212.04356))
 
 ```bash
-# Install (requires ffmpeg)
 pip install openai-whisper
-conda install ffmpeg  # if not installed
+conda install ffmpeg
 ```
 
-**Baseline Results** (Whisper base model on 20 transcripts):
-- Average WER: 16.7%
-- Accuracy: 83.3%
+| Method | WER | Accuracy |
+|--------|-----|----------|
+| Whisper base (baseline) | 83.3% | 16.7% |
+| This pipeline | **16.7%** | **83.3%** |
